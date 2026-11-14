@@ -678,7 +678,7 @@ impl McpRouter {
                             include_hud,
                             max_dimensions: (max_w, max_h),
                         },
-                        15_000,
+                        25_000,
                     )
                     .await?;
 
@@ -757,7 +757,7 @@ impl McpRouter {
                                 include_hud: false,
                                 max_dimensions: (1024, 1024),
                             },
-                            15_000,
+                            25_000,
                         )
                         .await?;
                     if let ViewerResponse::FrameCaptured(raw) = frame_resp {
@@ -1081,7 +1081,7 @@ impl McpRouter {
                             compile_target,
                             running,
                         },
-                        15_000,
+                        25_000,
                     )
                     .await?;
                 Ok(text_block(into_json(resp)))
@@ -1237,7 +1237,7 @@ impl McpRouter {
                             choice,
                             include_textures,
                         },
-                        15_000,
+                        25_000,
                     )
                     .await?;
                 Ok(text_block(into_json(resp)))
@@ -1594,7 +1594,7 @@ impl McpRouter {
                             emissive,
                             ribbon,
                         },
-                        15_000,
+                        25_000,
                     )
                     .await?;
                 Ok(text_block(into_json(resp)))
@@ -1614,7 +1614,7 @@ impl McpRouter {
                             location,
                             mfa_token,
                         },
-                        15_000,
+                        25_000,
                     )
                     .await?;
                 Ok(text_block(into_json(resp)))

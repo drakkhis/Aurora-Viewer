@@ -141,6 +141,8 @@ struct PendingScriptCompile {
     object_uuid: Uuid,
     item_id: Uuid,
     script_name: String,
+    compile: aurora_net::scripts::CompileTarget,
+    running: bool,
     started_at: Instant,
     reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
 }
@@ -164,6 +166,7 @@ struct PendingScriptCreation {
     source_code: String,
     compile: aurora_net::scripts::CompileTarget,
     running: bool,
+    experience: Uuid,
     started_at: Instant,
     last_requested: Instant,
     reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
@@ -337,6 +340,47 @@ impl App {
                     .remove(request)
                     .or_else(|| self.mcp_bridge.pending_script_compiles.remove(&target.item));
                 if let Some(pending) = pending {
+                    if let Ok(saved) = result {
+                        if let Some(inv) = self.build.contents.objects.get_mut(&pending.object_uuid)
+                            && let Some(item) = inv.items.iter_mut().find(|it| it.item_id == pending.item_id)
+                        {
+                            item.asset_id = saved.asset;
+                        }
+                        if let Some(idx) = self.world.objects.index_of_uuid(&pending.object_uuid) {
+                            let wanted_name = pending.script_name.trim();
+                            if saved.compiled && !wanted_name.is_empty() {
+                                let needs_rename = self
+                                    .build
+                                    .contents
+                                    .objects
+                                    .get(&pending.object_uuid)
+                                    .and_then(|inv| inv.items.iter().find(|it| it.item_id == pending.item_id))
+                                    .is_some_and(|it| it.name != wanted_name);
+                                if needs_rename {
+                                    self.build.rename_item(&self.world, idx, pending.item_id, wanted_name);
+                                }
+                            }
+                            let handle = self.world.objects.get(idx).map(|o| o.key.region).unwrap_or_default();
+                            if saved.compiled {
+                                self.build
+                                    .contents
+                                    .running
+                                    .insert((pending.object_uuid, pending.item_id), (pending.running, Some(pending.compile)));
+                                self.send(NetCommand::Build(BuildCmd::SetScriptRunning {
+                                    handle,
+                                    object_id: pending.object_uuid,
+                                    item_id: pending.item_id,
+                                    running: pending.running,
+                                }));
+                            }
+                            self.send(NetCommand::Build(BuildCmd::GetScriptRunning {
+                                handle,
+                                object_id: pending.object_uuid,
+                                item_id: pending.item_id,
+                            }));
+                            self.flush_build();
+                        }
+                    }
                     let resp = match result {
                         Ok(saved) => Ok(ViewerResponse::Json(json!({
                             "compiled": saved.compiled,
@@ -521,6 +565,8 @@ impl App {
                         object_uuid: creation.object_uuid,
                         item_id,
                         script_name: creation.script_name,
+                        compile: creation.compile,
+                        running: creation.running,
                         started_at: now,
                         reply_tx: creation.reply_tx,
                     },
@@ -532,7 +578,7 @@ impl App {
                     options: ScriptOptions {
                         compile: creation.compile,
                         running: creation.running,
-                        experience: Uuid::nil(),
+                        experience: creation.experience,
                     },
                     source: creation.source_code,
                 });
@@ -554,10 +600,10 @@ impl App {
         // 3. Expire timed-out script reads / compiles
         self.mcp_bridge
             .pending_script_reads
-            .retain(|_, pending| now.duration_since(pending.started_at) <= Duration::from_secs(5));
+            .retain(|_, pending| now.duration_since(pending.started_at) <= Duration::from_secs(20));
         self.mcp_bridge
             .pending_script_compiles
-            .retain(|_, pending| now.duration_since(pending.started_at) <= Duration::from_secs(5));
+            .retain(|_, pending| now.duration_since(pending.started_at) <= Duration::from_secs(20));
 
         // 4. Progress serialized COF mutation queue
         let cof_ready = self.world.outfit.is_done() && self.appearance_ui.pending.is_none() && !self.world.rlva_detach_in_flight(now);
@@ -778,6 +824,7 @@ impl App {
             } => {
                 let me = self.world.agent.position;
                 let needle = name_filter.as_deref().unwrap_or_default().to_ascii_lowercase();
+                let mut missing_props = Vec::new();
                 let mut rows: Vec<(f32, Value)> = self
                     .world
                     .objects
@@ -793,6 +840,9 @@ impl App {
                             return None;
                         }
                         let props = self.build.props.get(&o.full_id);
+                        if props.is_none() {
+                            missing_props.push((dist, o.key.region, o.full_id));
+                        }
                         let obj_name = props
                             .map(|p| p.name.clone())
                             .filter(|s| !s.is_empty())
@@ -840,6 +890,10 @@ impl App {
                         ))
                     })
                     .collect();
+                missing_props.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for (_, handle, object) in missing_props.into_iter().take(64) {
+                    self.send(NetCommand::RequestObjectProperties { handle, object });
+                }
                 rows.sort_by(|a, b| a.0.total_cmp(&b.0));
                 let objects: Vec<Value> = rows.into_iter().take(limit).map(|(_, v)| v).collect();
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
@@ -2485,15 +2539,21 @@ impl App {
             return Err(McpError::InvalidParams("Object not found".into()));
         };
         if self.world.god_level == 0 {
-            if obj.owner_id.is_nil() {
+            let props = self.build.props.get(&obj.full_id);
+            let owner_id = if !obj.owner_id.is_nil() {
+                obj.owner_id
+            } else {
+                props.map(|p| p.owner_id).unwrap_or(Uuid::nil())
+            };
+            if owner_id.is_nil() {
                 return Err(McpError::PermissionDenied(
                     "object ownership is unknown; fetch object properties before modifying".into(),
                 ));
             }
-            if obj.owner_id != self.world.agent_id {
+            if owner_id != self.world.agent_id {
                 return Err(McpError::PermissionDenied("you do not have Modify rights on this object".into()));
             }
-            if let Some(props) = self.build.props.get(&obj.full_id)
+            if let Some(props) = props
                 && (props.owner_mask & perm::MODIFY) == 0
             {
                 return Err(McpError::PermissionDenied("object lacks Modify permission".into()));
@@ -2679,7 +2739,16 @@ impl App {
                 return;
             }
         };
-        let object_uuid = self.world.objects.get(idx).unwrap().full_id;
+        let (handle, object_uuid) = {
+            let obj = self.world.objects.get(idx).unwrap();
+            (obj.key.region, obj.full_id)
+        };
+        if !self.build.props.contains_key(&object_uuid) {
+            self.send(NetCommand::RequestObjectProperties {
+                handle,
+                object: object_uuid,
+            });
+        }
         self.build.request_contents(&self.world, idx, true);
         self.flush_build();
 
@@ -2854,6 +2923,31 @@ impl App {
                 return;
             }
         };
+        let source_code = if let Some(path) = source_code.strip_prefix("@file:") {
+            match std::fs::read_to_string(path.trim()) {
+                Ok(text) => text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n"),
+                Err(err) => {
+                    let _ = reply_tx.send(Err(McpError::InvalidParams(format!(
+                        "Failed to read script source file '{}': {err}",
+                        path.trim()
+                    ))));
+                    return;
+                }
+            }
+        } else {
+            source_code
+        };
+        let experience = if source_code.contains("llRequestExperiencePermissions")
+            || source_code.contains("experience_permissions")
+            || source_code.contains("llSitOnLink")
+            || source_code.contains("llAgentInExperience")
+            || script_name.starts_with("SLC_Ball_Seat")
+        {
+            uuid::uuid!("c464cb46-f477-11e8-9486-fa4c4c716c89")
+        } else {
+            Uuid::nil()
+        };
+
         let is_lua = matches!(compile, aurora_net::scripts::CompileTarget::Luau);
         if self.world.rlva.has("viewscript") {
             let _ = reply_tx.send(Err(McpError::PermissionDenied(
@@ -2881,10 +2975,11 @@ impl App {
         self.flush_build();
 
         let existing = self.build.contents.objects.get(&object_uuid).and_then(|inv| {
-            inv.items
-                .iter()
-                .find(|it| script_item_id.is_some_and(|id| it.item_id == id) || it.name.eq_ignore_ascii_case(&script_name))
-                .cloned()
+            if let Some(id) = script_item_id {
+                inv.items.iter().find(|it| it.item_id == id).cloned()
+            } else {
+                inv.items.iter().find(|it| it.name.eq_ignore_ascii_case(&script_name)).cloned()
+            }
         });
 
         let known_script_ids: HashSet<Uuid> = self
@@ -2948,6 +3043,7 @@ impl App {
                     source_code,
                     compile,
                     running,
+                    experience,
                     started_at: Instant::now(),
                     last_requested: Instant::now(),
                     reply_tx,
@@ -2969,6 +3065,8 @@ impl App {
                 object_uuid,
                 item_id: resolved_item_id,
                 script_name,
+                compile,
+                running,
                 started_at: Instant::now(),
                 reply_tx,
             },
@@ -2980,7 +3078,7 @@ impl App {
             options: ScriptOptions {
                 compile,
                 running,
-                experience: Uuid::nil(),
+                experience,
             },
             source: source_code,
         });

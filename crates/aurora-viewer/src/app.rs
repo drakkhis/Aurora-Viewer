@@ -1976,15 +1976,20 @@ impl App {
             parcel_music: Default::default(),
             music_status: Default::default(),
             music_error_said: Default::default(),
-            audio_engine: match aurora_audio::AudioEngine::new_with_device(out_device) {
-                Ok(e) => {
-                    let o = e.output_info();
-                    log::info!("audio: {} ({} Hz, {} canaux)", o.device_name, o.sample_rate, o.channels);
-                    Some(e)
-                }
-                Err(e) => {
-                    log::warn!("audio disabled: {e}");
-                    None
+            audio_engine: if crate::cli::get().headless {
+                log::info!("audio: disabled in headless mode");
+                None
+            } else {
+                match aurora_audio::AudioEngine::new_with_device(out_device) {
+                    Ok(e) => {
+                        let o = e.output_info();
+                        log::info!("audio: {} ({} Hz, {} canaux)", o.device_name, o.sample_rate, o.channels);
+                        Some(e)
+                    }
+                    Err(e) => {
+                        log::warn!("audio disabled: {e}");
+                        None
+                    }
                 }
             },
             applied_audio: None,
@@ -4901,7 +4906,7 @@ impl App {
     /// conversations' cards. Demo captures stay silent unless
     /// AURORA_DEMO_SOUND is set.
     fn media_volume(&self) -> f32 {
-        if self.demo && std::env::var_os("AURORA_DEMO_SOUND").is_none() {
+        if crate::cli::get().headless || (self.demo && std::env::var_os("AURORA_DEMO_SOUND").is_none()) {
             return 0.0;
         }
         audio_mute::media_volume(&self.settings.audio, self.minimized_mute.active)
@@ -4928,7 +4933,7 @@ impl App {
 
     /// Voice transmission wanted (microphone button / push-to-talk).
     fn talking(&self) -> bool {
-        if self.minimized_mute.active || self.speak_denied().is_some() {
+        if crate::cli::get().headless || self.minimized_mute.active || self.speak_denied().is_some() {
             false
         } else if self.settings.audio.mic_hold {
             self.mic_button_held || self.settings.keybinds.held(Action::PushToTalk, &self.down, self.mods())

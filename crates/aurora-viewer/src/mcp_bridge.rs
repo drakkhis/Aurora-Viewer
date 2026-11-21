@@ -6,16 +6,22 @@
 
 use super::*;
 
+#[path = "mcp_bridge/building.rs"]
+mod building;
 #[path = "mcp_bridge/contents.rs"]
 mod contents;
 #[path = "mcp_bridge/inventory.rs"]
 mod inv_tools;
 #[path = "mcp_bridge/offers.rs"]
 mod offers;
+#[path = "mcp_bridge/perception.rs"]
+mod perception;
+#[path = "mcp_bridge/social.rs"]
+mod social;
 use aurora_mcp::{
-    AppearanceOperation, BoneTransform, CameraCommand, CaptureBufferType, ChatKind, FRAME_BUDGET_MICROS, LinksetDataStore, LsdOperation,
-    McpError, McpRequestEnvelope, McpServerHandle, PrimTransformSpec, RawCapturedFrame, RollbackAction, ViewerRequest, ViewerResponse,
-    create_bridge_channels, spawn_server,
+    AppearanceOperation, BoneTransform, CameraCommand, CaptureBufferType, ChatKind, EventBus, FRAME_BUDGET_MICROS, KNOWN_EVENT_SOURCES,
+    LinksetDataStore, LsdOperation, McpError, McpRequestEnvelope, McpServerHandle, PrimTransformSpec, RawCapturedFrame, RollbackAction,
+    ViewerRequest, ViewerResponse, create_bridge_channels, spawn_server,
 };
 use aurora_net::build::{BuildCmd, NewPrim, TransformUpdate, perm};
 use aurora_net::land::{AL_ACCESS, AL_BAN, AccessEntry, LandCommand, ParcelUpdate};
@@ -30,9 +36,6 @@ use uuid::Uuid;
 
 /// Hard per-frame budget for draining MCP requests on the main UI thread.
 const MCP_FRAME_BUDGET: Duration = Duration::from_micros(FRAME_BUDGET_MICROS);
-
-/// Maximum number of subscribed viewer events buffered for `events_read`.
-const MAX_EVENTS_BUFFER: usize = 500;
 
 /// Entry in the serialized COF (Current Outfit Folder) mutation queue.
 pub struct QueuedCofMutation {
@@ -226,6 +229,16 @@ struct PendingNotecardDrop {
     reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
 }
 
+/// A walk started through MCP and how it ended.
+#[derive(Debug, Clone)]
+struct McpWalk {
+    target: Vec3,
+    stop_distance: f32,
+    deadline: Option<Instant>,
+    /// arrived, no_progress, timed_out, stopped or interrupted; None while walking.
+    outcome: Option<&'static str>,
+}
+
 /// Main-thread state for the Model Context Protocol (MCP) bridge.
 #[derive(Default)]
 pub struct McpBridge {
@@ -235,9 +248,12 @@ pub struct McpBridge {
     rx: Option<mpsc::Receiver<McpRequestEnvelope>>,
     server_handle: Option<McpServerHandle>,
     status_snapshot: Option<Arc<std::sync::RwLock<Value>>>,
-    subscribed_sources: HashSet<String>,
-    events_buffer: VecDeque<Value>,
-    next_event_seq: u64,
+    pub events: Option<Arc<EventBus>>,
+    pub policy: Option<Arc<aurora_mcp::McpPolicy>>,
+    last_seen_notification_id: u64,
+    known_radar_avatars: HashMap<Uuid, String>,
+    radar_seeded: bool,
+    last_health: Option<f32>,
     pending_captures: VecDeque<PendingCapture>,
     pub cof_queue: CofMutationQueue,
     pub build_tx_mgr: BuildTransactionManager,
@@ -248,6 +264,16 @@ pub struct McpBridge {
     pending_trash: VecDeque<inv_tools::PendingTrash>,
     pending_radar: VecDeque<PendingRadar>,
     pending_offers: VecDeque<offers::PendingOffer>,
+    pending_object_inspects: VecDeque<perception::PendingObjectInspect>,
+    pending_map_lookups: VecDeque<perception::PendingMapLookup>,
+    pending_searches: VecDeque<perception::PendingSearch>,
+    pending_profiles: VecDeque<perception::PendingProfile>,
+    pending_media_info: VecDeque<perception::PendingMediaInfo>,
+    pending_landmarks: VecDeque<social::PendingLandmark>,
+    pending_duplicates: VecDeque<building::PendingDuplicate>,
+    pending_folder_creates: VecDeque<inv_tools::PendingFolderCreate>,
+    pending_inv_moves: VecDeque<inv_tools::PendingInvMove>,
+    pending_inv_renames: VecDeque<inv_tools::PendingInvRename>,
     /// The last source sent per object (bytes, sha256): reported back
     /// instead of the source, which may hold keys.
     script_fingerprints: HashMap<Uuid, (usize, String)>,
@@ -259,9 +285,15 @@ pub struct McpBridge {
     mcp_poses: HashMap<Uuid, Arc<crate::ik_edit::poser::SubjectPose>>,
     mesh_textures_configured: HashSet<Uuid>,
     local_mesh_auto_reload: bool,
-    pub sse_tx: Option<tokio::sync::broadcast::Sender<String>>,
     pub last_voice_speaking: HashMap<Uuid, bool>,
     session_lindens_spent: i32,
+    /// L$ spent on uploads through MCP this session (AURORA_MCP_UPLOAD_BUDGET).
+    session_upload_spent: i32,
+    /// The walk an MCP agent started (avatar_walk_to): its deadline and how it ended.
+    mcp_walk: Option<McpWalk>,
+    /// What the RLVa send boundary made of the command `mcp_send` sent.
+    pub(crate) last_boundary: Option<crate::world::rlva::Boundary>,
+    pub(crate) recording_boundary: bool,
     pub(crate) shutdown_requested: bool,
     pub(crate) shutdown_completed: bool,
 }
@@ -274,33 +306,20 @@ impl McpBridge {
         }
     }
 
-    /// Pushes a viewer event into the bounded subscription ring buffer if its
-    /// source category is currently subscribed.
+    /// Pushes a viewer event onto the shared [`EventBus`] so per-session
+    /// subscribers, SSE streams, and `wait_for_event` callers receive it.
     pub fn push_event(&mut self, source: &str, event_type: &str, payload: Value) {
-        if !self.subscribed_sources.contains("*") && !self.subscribed_sources.contains("all") && !self.subscribed_sources.contains(source) {
-            return;
+        if let Some(events) = &self.events {
+            events.publish(source, event_type, payload);
         }
-        self.next_event_seq += 1;
-        let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let event_json = json!({
-            "seq": self.next_event_seq,
-            "timestamp_ms": ts_ms,
-            "source": source,
-            "type": event_type,
-            "data": payload,
-        });
-        if let Some(sse_tx) = &self.sse_tx {
-            let notification = json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/message",
-                "params": event_json.clone()
-            });
-            let _ = sse_tx.send(notification.to_string());
-        }
-        if self.events_buffer.len() >= MAX_EVENTS_BUFFER {
-            self.events_buffer.pop_front();
-        }
-        self.events_buffer.push_back(event_json);
+    }
+
+    /// Returns the server's active [`aurora_mcp::McpPolicy`] (loaded from config file
+    /// + environment overrides), falling back to loading once if uninitialized.
+    pub fn effective_policy(&self) -> Arc<aurora_mcp::McpPolicy> {
+        self.policy
+            .clone()
+            .unwrap_or_else(|| Arc::new(aurora_mcp::McpPolicy::from_env_and_file()))
     }
 }
 
@@ -324,7 +343,8 @@ impl App {
                 log::info!("MCP server listening on http://{}/mcp", handle.bind_addr);
                 *handle.status_snapshot.write().unwrap_or_else(|e| e.into_inner()) = self.build_mcp_status_snapshot(None);
                 self.mcp_bridge.status_snapshot = Some(handle.status_snapshot.clone());
-                self.mcp_bridge.sse_tx = Some(handle.sse_tx.clone());
+                self.mcp_bridge.events = Some(handle.events.clone());
+                self.mcp_bridge.policy = Some(handle.policy.clone());
                 self.mcp_bridge.rx = Some(rx);
                 self.mcp_bridge.server_handle = Some(handle);
             }
@@ -416,19 +436,19 @@ impl App {
     pub(super) fn mcp_observe_event(&mut self, ev: &NetEvent) {
         match ev {
             NetEvent::Chat(msg) => {
-                self.mcp_bridge.push_event(
-                    "chat",
-                    "ChatFromSimulator",
-                    json!({
-                        "from_name": msg.from_name,
-                        "source_id": msg.source_id.to_string(),
-                        "owner_id": msg.owner_id.to_string(),
-                        "chat_type": format!("{:?}", msg.chat_type),
-                        "source_type": format!("{:?}", msg.source_type),
-                        "message": msg.message,
-                        "position": [msg.position.x, msg.position.y, msg.position.z],
-                    }),
-                );
+                let chat_payload = json!({
+                    "from_name": msg.from_name,
+                    "source_id": msg.source_id.to_string(),
+                    "owner_id": msg.owner_id.to_string(),
+                    "chat_type": format!("{:?}", msg.chat_type),
+                    "source_type": format!("{:?}", msg.source_type),
+                    "message": msg.message,
+                    "position": [msg.position.x, msg.position.y, msg.position.z],
+                });
+                self.mcp_bridge.push_event("chat", "ChatFromSimulator", chat_payload.clone());
+                if msg.chat_type == aurora_net::ChatType::Debug {
+                    self.mcp_bridge.push_event("script", "ScriptError", chat_payload);
+                }
             }
             NetEvent::InstantMessage(im) => {
                 self.mcp_bridge.push_event(
@@ -443,11 +463,27 @@ impl App {
                     }),
                 );
             }
-            NetEvent::AgentMovementComplete { position, .. } => {
+            NetEvent::TeleportStarted { flags } => {
+                self.mcp_bridge.push_event("teleport", "TeleportStarted", json!({ "flags": flags }));
+            }
+            NetEvent::TeleportProgress { message, flags } => {
+                self.mcp_bridge
+                    .push_event("teleport", "TeleportProgress", json!({ "message": message, "flags": flags }));
+            }
+            NetEvent::AgentMovementComplete { handle, position, .. } => {
+                let region_name = self
+                    .world
+                    .regions
+                    .get(handle)
+                    .and_then(|r| r.info.as_ref())
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| self.world.region_name());
                 self.mcp_bridge.push_event(
                     "teleport",
                     "AgentMovementComplete",
                     json!({
+                        "handle": handle,
+                        "region_name": region_name,
                         "position": [position.x, position.y, position.z],
                     }),
                 );
@@ -460,6 +496,96 @@ impl App {
                         "reason": reason,
                     }),
                 );
+            }
+            NetEvent::TeleportAccessBlocked(blocked) => {
+                self.mcp_bridge.push_event(
+                    "teleport",
+                    "TeleportAccessBlocked",
+                    json!({
+                        "code": blocked.code,
+                        "region_access": blocked.region_access,
+                    }),
+                );
+            }
+            NetEvent::MainRegionChanged { handle } => {
+                self.mcp_bridge.radar_seeded = false;
+                let region_name = self
+                    .world
+                    .regions
+                    .get(handle)
+                    .and_then(|r| r.info.as_ref())
+                    .map(|i| i.name.clone())
+                    .unwrap_or_else(|| self.world.region_name());
+                self.mcp_bridge.push_event(
+                    "region",
+                    "MainRegionChanged",
+                    json!({
+                        "handle": handle,
+                        "region_name": region_name,
+                    }),
+                );
+            }
+            NetEvent::RegionRestart(notice) => {
+                self.mcp_bridge.push_event(
+                    "region",
+                    "RegionRestart",
+                    json!({
+                        "seconds": notice.seconds,
+                        "region": notice.region,
+                        "opensim": notice.opensim,
+                    }),
+                );
+            }
+            NetEvent::RegionRestartCancelled => {
+                self.mcp_bridge.push_event("region", "RegionRestartCancelled", json!({}));
+            }
+            NetEvent::Disconnected { reason, lost } => {
+                self.mcp_bridge.radar_seeded = false;
+                self.mcp_bridge.push_event(
+                    "region",
+                    "Disconnected",
+                    json!({
+                        "reason": reason,
+                        "lost": lost,
+                    }),
+                );
+            }
+            NetEvent::LoggedOut => {
+                self.mcp_bridge.radar_seeded = false;
+                self.mcp_bridge.push_event("region", "LoggedOut", json!({}));
+            }
+            NetEvent::Alert { message } => {
+                self.mcp_bridge.push_event("region", "Alert", json!({ "message": message }));
+            }
+            NetEvent::MeanCollisions(list) if !list.is_empty() => {
+                let items: Vec<Value> = list
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "perp": c.perp.to_string(),
+                            "time": c.time,
+                            "magnitude": c.magnitude,
+                            "kind": c.kind,
+                        })
+                    })
+                    .collect();
+                self.mcp_bridge
+                    .push_event("collision", "MeanCollisions", json!({ "collisions": items }));
+            }
+            NetEvent::Health(h) => {
+                if let Some(prev) = self.mcp_bridge.last_health
+                    && (prev - *h).abs() > 0.01
+                {
+                    self.mcp_bridge.push_event(
+                        "collision",
+                        "HealthChanged",
+                        json!({
+                            "previous": prev,
+                            "health": *h,
+                        }),
+                    );
+                }
+                self.mcp_bridge.last_health = Some(*h);
             }
             NetEvent::ScriptLoaded { request, target, result } => {
                 let pending = self
@@ -485,6 +611,20 @@ impl App {
                 }
             }
             NetEvent::ScriptSaved { request, target, result } => {
+                let (compiled, errors) = match result {
+                    Ok(saved) => (saved.compiled, saved.errors.clone()),
+                    Err(err) => (false, vec![err.clone()]),
+                };
+                self.mcp_bridge.push_event(
+                    "script",
+                    "ScriptSaved",
+                    json!({
+                        "object_uuid": target.object.to_string(),
+                        "item_id": target.item.to_string(),
+                        "compiled": compiled,
+                        "errors": errors,
+                    }),
+                );
                 let pending = self
                     .mcp_bridge
                     .pending_script_compiles
@@ -744,6 +884,13 @@ impl App {
                             name: assigned_name.clone(),
                         }));
                     }
+                    let rezzed_payload = json!({
+                        "local_id": local_id,
+                        "uuid": object_uuid.to_string(),
+                        "name": assigned_name,
+                        "position": pos,
+                    });
+                    self.mcp_bridge.push_event("script", "ObjectRezzed", rezzed_payload);
                     let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                         "status": "rezzed",
                         "local_id": local_id,
@@ -1017,8 +1164,11 @@ impl App {
             }
         }
 
-        // 4. Progress voice speaker activity monitoring for realtime SSE
-        if self.mcp_bridge.sse_tx.is_some() && self.voice.connected {
+        // 5. An MCP walk: its timeout, and how it ended
+        self.progress_mcp_walk();
+
+        // 6. Voice speaker activity, notification prompts/offers, and radar deltas
+        if self.mcp_bridge.events.is_some() && self.voice.connected {
             let levels = self.voice.levels(self.world.agent_id);
             for (id, &(level, speaking)) in &levels {
                 let was_speaking = self.mcp_bridge.last_voice_speaking.get(id).copied().unwrap_or(false);
@@ -1036,6 +1186,315 @@ impl App {
                 }
             }
         }
+        self.poll_mcp_object_inspect();
+        self.poll_mcp_map_lookup();
+        self.poll_mcp_search();
+        self.poll_mcp_profile();
+        self.poll_mcp_media_info();
+        self.poll_mcp_landmark_create();
+        self.poll_mcp_prim_duplicate();
+        self.poll_mcp_inventory_create_folder();
+        self.poll_mcp_inventory_move();
+        self.poll_mcp_inventory_rename();
+        self.progress_mcp_notification_events();
+        self.progress_mcp_radar_events();
+    }
+
+    /// Emits `prompt` and `offer` events once for newly arrived notifications.
+    fn progress_mcp_notification_events(&mut self) {
+        if self.mcp_bridge.events.is_none() {
+            return;
+        }
+        use crate::world::notifications::Data;
+        let last_seen = self.mcp_bridge.last_seen_notification_id;
+        let mut max_id = last_seen;
+        let mut outgoing: Vec<(&'static str, &'static str, Value)> = Vec::new();
+        for n in &self.world.notifications.list {
+            if n.id <= last_seen {
+                continue;
+            }
+            max_id = max_id.max(n.id);
+            let mapped = match &n.data {
+                Data::Dialog {
+                    object,
+                    object_name,
+                    channel,
+                    buttons,
+                    ..
+                } => Some((
+                    "prompt",
+                    "ScriptDialog",
+                    json!({
+                        "prompt_id": n.id,
+                        "object_id": object.to_string(),
+                        "object_name": object_name,
+                        "channel": channel,
+                        "message": n.body,
+                        "buttons": buttons,
+                    }),
+                )),
+                Data::TextBox { object, channel, .. } => Some((
+                    "prompt",
+                    "ScriptTextBox",
+                    json!({
+                        "prompt_id": n.id,
+                        "object_id": object.to_string(),
+                        "channel": channel,
+                        "title": n.title,
+                        "message": n.body,
+                    }),
+                )),
+                Data::Permissions {
+                    task,
+                    questions,
+                    experience,
+                    caution,
+                    ..
+                } => {
+                    let debit = (*questions & PERMISSION_DEBIT) != 0;
+                    let debit_ok = debit.then(|| self.mcp_debit_allowed(*task, caution.as_ref().map(|c| c.owner_name.as_str())));
+                    Some((
+                        "prompt",
+                        "ScriptPermissions",
+                        json!({
+                            "prompt_id": n.id,
+                            "object_id": task.to_string(),
+                            "title": n.title,
+                            "message": n.body,
+                            "questions": questions,
+                            "permissions": crate::world::notifications::permission_lines(*questions),
+                            "takes_money": debit,
+                            "debit_allowed": debit_ok,
+                            "experience": experience.as_ref().map(|e| json!({ "id": e.id.to_string(), "name": e.name })),
+                            "caution": caution.is_some(),
+                        }),
+                    ))
+                }
+                Data::Inventory {
+                    from,
+                    tx,
+                    asset_type,
+                    object,
+                    task,
+                    ..
+                } => Some((
+                    "offer",
+                    "InventoryOffer",
+                    json!({
+                        "offer_id": n.id,
+                        "from_id": from.to_string(),
+                        "item_name": n.title,
+                        "message": n.body,
+                        "asset_type": asset_type,
+                        "item_id": (!object.is_nil()).then(|| object.to_string()),
+                        "from_object": task,
+                        "transaction_id": tx.to_string(),
+                    }),
+                )),
+                Data::Lure {
+                    from,
+                    invite,
+                    change_rating,
+                } => Some((
+                    "offer",
+                    "TeleportLure",
+                    json!({
+                        "offer_id": n.id,
+                        "from_id": from.to_string(),
+                        "invite": invite,
+                        "change_rating": change_rating,
+                        "title": n.title,
+                        "message": n.body,
+                    }),
+                )),
+                Data::TeleportRequest { from, invite } => Some((
+                    "offer",
+                    "TeleportRequest",
+                    json!({
+                        "offer_id": n.id,
+                        "from_id": from.to_string(),
+                        "invite": invite,
+                        "title": n.title,
+                        "message": n.body,
+                    }),
+                )),
+                Data::Friend { from, tx, offline } => Some((
+                    "offer",
+                    "FriendshipOffer",
+                    json!({
+                        "offer_id": n.id,
+                        "from_id": from.to_string(),
+                        "transaction_id": tx.to_string(),
+                        "offline": offline,
+                        "title": n.title,
+                        "message": n.body,
+                    }),
+                )),
+                Data::Group {
+                    group, tx, offline, fee, ..
+                } => Some((
+                    "offer",
+                    "GroupInvitation",
+                    json!({
+                        "offer_id": n.id,
+                        "group_id": group.to_string(),
+                        "transaction_id": tx.to_string(),
+                        "offline": offline,
+                        "fee": fee,
+                        "title": n.title,
+                        "message": n.body,
+                    }),
+                )),
+                Data::GroupNotice { group, attachment } => Some((
+                    "offer",
+                    "GroupNotice",
+                    json!({
+                        "offer_id": n.id,
+                        "group_id": group.to_string(),
+                        "has_attachment": attachment.is_some(),
+                        "title": n.title,
+                        "message": n.body,
+                    }),
+                )),
+                _ => None,
+            };
+            if let Some(ev) = mapped {
+                outgoing.push(ev);
+            }
+        }
+        self.mcp_bridge.last_seen_notification_id = max_id;
+        for (source, event_type, payload) in outgoing {
+            self.mcp_bridge.push_event(source, event_type, payload);
+        }
+    }
+
+    /// Emits `radar` `AvatarEntered` and `AvatarLeft` diffs while in-world.
+    fn progress_mcp_radar_events(&mut self) {
+        if self.mcp_bridge.events.is_none() {
+            return;
+        }
+        if !self.in_world() {
+            self.mcp_bridge.known_radar_avatars.clear();
+            self.mcp_bridge.radar_seeded = false;
+            return;
+        }
+        let me = self.world.agent.position;
+        let current: HashMap<Uuid, (String, [f32; 3], f32)> = self
+            .world
+            .objects
+            .iter()
+            .filter(|(_, o)| o.is_avatar() && o.parent_id == 0 && o.full_id != self.world.agent_id)
+            .map(|(_, o)| {
+                let name = self.world.social.display_name_of(&o.full_id);
+                let dist = o.position.distance(me);
+                (o.full_id, (name, [o.position.x, o.position.y, o.position.z], dist))
+            })
+            .collect();
+
+        if !self.mcp_bridge.radar_seeded {
+            self.mcp_bridge.known_radar_avatars = current.into_iter().map(|(id, (name, _, _))| (id, name)).collect();
+            self.mcp_bridge.radar_seeded = true;
+            return;
+        }
+
+        let mut entered = Vec::new();
+        for (&id, (name, pos, dist)) in &current {
+            if !self.mcp_bridge.known_radar_avatars.contains_key(&id) {
+                entered.push((id, name.clone(), *pos, *dist));
+            }
+        }
+        let mut left = Vec::new();
+        for (&id, name) in &self.mcp_bridge.known_radar_avatars {
+            if !current.contains_key(&id) {
+                left.push((id, name.clone()));
+            }
+        }
+        self.mcp_bridge.known_radar_avatars = current.into_iter().map(|(id, (name, _, _))| (id, name)).collect();
+
+        for (id, name, pos, dist) in entered {
+            self.mcp_bridge.push_event(
+                "radar",
+                "AvatarEntered",
+                json!({
+                    "uuid": id.to_string(),
+                    "name": name,
+                    "position": pos,
+                    "distance_m": (dist * 100.0).round() / 100.0,
+                }),
+            );
+        }
+        for (id, name) in left {
+            self.mcp_bridge.push_event(
+                "radar",
+                "AvatarLeft",
+                json!({
+                    "uuid": id.to_string(),
+                    "name": name,
+                }),
+            );
+        }
+    }
+
+    /// Send a command an MCP tool reports on: through the same RLVa send
+    /// boundary as the interface, but a refused or dropped command fails the
+    /// tool instead of being claimed as done.
+    pub(super) fn mcp_send(&mut self, cmd: NetCommand) -> Result<(), McpError> {
+        self.mcp_bridge.last_boundary = None;
+        self.mcp_bridge.recording_boundary = true;
+        self.send(cmd);
+        self.mcp_bridge.recording_boundary = false;
+        match self.mcp_bridge.last_boundary.take() {
+            Some(crate::world::rlva::Boundary::Refused) => Err(McpError::PermissionDenied(
+                "an RLVa restriction refused this action (the person's own RLV locks apply to agents too)".into(),
+            )),
+            Some(crate::world::rlva::Boundary::Dropped) => Err(McpError::PermissionDenied(
+                "the viewer did not send this action (RLVa or a lock left nothing of it)".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// An MCP walk past its deadline stops; one whose autopilot ended (or
+    /// was replaced by the person's own walk) records how.
+    fn progress_mcp_walk(&mut self) {
+        let Some(walk) = self.mcp_bridge.mcp_walk.as_ref().filter(|w| w.outcome.is_none()) else {
+            return;
+        };
+        let (target, deadline) = (walk.target, walk.deadline);
+        let ours = self.autopilot.as_ref().is_some_and(|ap| ap.target == target);
+        if ours {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                self.stop_autopilot(false);
+                self.mcp_finish_walk("timed_out");
+            }
+            return;
+        }
+        let pos = self.world.agent.position;
+        let close = Vec3::new(target.x - pos.x, target.y - pos.y, 0.0).length() <= walk.stop_distance.max(0.5) + 0.25;
+        let outcome = match (&self.autopilot, close) {
+            (_, true) => "arrived",
+            (None, false) => "no_progress",
+            (Some(_), false) => "interrupted",
+        };
+        self.mcp_finish_walk(outcome);
+    }
+
+    fn mcp_finish_walk(&mut self, outcome: &'static str) {
+        let Some(walk) = self.mcp_bridge.mcp_walk.as_mut().filter(|w| w.outcome.is_none()) else {
+            return;
+        };
+        walk.outcome = Some(outcome);
+        let pos = self.world.agent.position;
+        let target = walk.target;
+        self.mcp_bridge.push_event(
+            "nav",
+            "WalkFinished",
+            json!({
+                "outcome": outcome,
+                "position": [pos.x, pos.y, pos.z],
+                "target": [target.x, target.y, target.z],
+            }),
+        );
     }
 
     fn handle_mcp_envelope(&mut self, envelope: McpRequestEnvelope, mut renderer: Option<&mut Renderer>) {
@@ -1057,37 +1516,56 @@ impl App {
                     "region": region_name,
                 }))));
             }
+            ViewerRequest::CapabilitiesSummary => {
+                let region_name = self.in_world().then(|| self.world.region_name());
+                let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
+                    "connected": self.in_world(),
+                    "agent_id": self.world.agent_id.to_string(),
+                    "display_name": self.world.notifications.own_name,
+                    "region_name": region_name,
+                    "rlva_enabled": self.settings.rlva_enabled,
+                    "rlva_restrictions_count": self.world.rlva.restrictions().len(),
+                    "balance": self.world.balance,
+                    "session_lindens_spent": self.mcp_bridge.session_lindens_spent,
+                    "session_upload_spent": self.mcp_bridge.session_upload_spent,
+                    "parcel": self.mcp_capabilities_parcel_summary(),
+                }))));
+            }
             ViewerRequest::ViewerCall { api, operation, arguments } => {
                 let resp = self.handle_legacy_viewer_call(&api, &operation, &arguments);
                 let _ = reply_tx.send(resp);
             }
             ViewerRequest::EventsSubscribe { source } => {
-                self.mcp_bridge.subscribed_sources.insert(source);
-                let active: Vec<String> = self.mcp_bridge.subscribed_sources.iter().cloned().collect();
+                let active = self
+                    .mcp_bridge
+                    .events
+                    .as_ref()
+                    .map(|e| e.subscribe_session("default", &source))
+                    .unwrap_or_default();
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "subscribed": active,
+                    "available_sources": KNOWN_EVENT_SOURCES,
                 }))));
             }
             ViewerRequest::EventsUnsubscribe { source } => {
-                if source == "*" || source.eq_ignore_ascii_case("all") {
-                    self.mcp_bridge.subscribed_sources.clear();
-                } else {
-                    self.mcp_bridge.subscribed_sources.remove(&source);
-                }
-                let active: Vec<String> = self.mcp_bridge.subscribed_sources.iter().cloned().collect();
+                let active = self
+                    .mcp_bridge
+                    .events
+                    .as_ref()
+                    .map(|e| e.unsubscribe_session("default", &source))
+                    .unwrap_or_default();
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "subscribed": active,
                 }))));
             }
             ViewerRequest::EventsRead { after } => {
-                let events: Vec<Value> = self
-                    .mcp_bridge
-                    .events_buffer
-                    .iter()
-                    .filter(|ev| ev["seq"].as_u64().unwrap_or(0) > after)
-                    .cloned()
-                    .collect();
-                let last_seq = self.mcp_bridge.next_event_seq;
+                let (events, last_seq) = match &self.mcp_bridge.events {
+                    Some(bus) => {
+                        let (evs, _, last, _) = bus.read_for_session("default", Some(after), None, 200);
+                        (evs.into_iter().map(|e| e.to_json()).collect::<Vec<Value>>(), last)
+                    }
+                    None => (Vec::new(), 0),
+                };
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "count": events.len(),
                     "last_seq": last_seq,
@@ -1226,11 +1704,14 @@ impl App {
                 target_uuid,
             } => {
                 if let Some(target) = target_uuid {
-                    self.world.own_im(target, &message);
-                    self.send(NetCommand::SendIm {
+                    if let Err(e) = self.mcp_send(NetCommand::SendIm {
                         to: target,
                         message: message.clone(),
-                    });
+                    }) {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
+                    self.world.own_im(target, &message);
                     let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                         "sent": true,
                         "mode": "im",
@@ -1243,6 +1724,24 @@ impl App {
                         ChatKind::Normal => aurora_net::ChatType::Normal,
                         ChatKind::Shout => aurora_net::ChatType::Shout,
                     };
+                    // the same RLVa filter the chat bar's line goes through
+                    // (@sendchat, @sendchannel, @redirchat), asked first so a
+                    // refused line is reported instead of claimed as said
+                    let outgoing = self.world.rlva.outgoing_chat(&message, channel, ct);
+                    let altered = match outgoing.as_slice() {
+                        [] => {
+                            let _ = reply_tx.send(Err(McpError::PermissionDenied(format!(
+                                "an RLVa restriction (@sendchat / @sendchannel) keeps this line off channel {channel}"
+                            ))));
+                            return;
+                        }
+                        [
+                            NetCommand::Chat {
+                                message: m, channel: c, ..
+                            },
+                        ] => m != &message || *c != channel,
+                        _ => true,
+                    };
                     self.send(NetCommand::Chat {
                         message: message.clone(),
                         channel,
@@ -1250,6 +1749,7 @@ impl App {
                     });
                     let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                         "sent": true,
+                        "rlva_altered": altered,
                         "mode": "chat",
                         "channel": channel,
                         "chat_type": format!("{ct:?}"),
@@ -1260,23 +1760,41 @@ impl App {
             ViewerRequest::NavWalkTo {
                 position,
                 allow_flying,
-                stop_distance: _,
-                timeout_ms: _,
+                stop_distance,
+                timeout_ms,
             } => {
                 if allow_flying {
                     self.world.agent.flying = true;
                 }
                 let target = Vec3::from_array(position);
-                self.autopilot = Some(crate::autopilot::AutoPilot::start(
-                    self.world.agent.position,
+                // a double click's walk: the point must be one RLVa lets a
+                // local teleport reach (@tplocal, @sittp, @unsit when seated)
+                if let Some(here) = self.world.agent_global() {
+                    let global = here + (target - self.world.agent.position).as_dvec3();
+                    if !self.world.rlva_can_teleport_local(global) {
+                        let _ = reply_tx.send(Err(McpError::PermissionDenied(
+                            "an RLVa restriction (@tplocal / @sittp / @unsit) blocks walking there".into(),
+                        )));
+                        return;
+                    }
+                }
+                let now = Instant::now();
+                let pilot =
+                    crate::autopilot::AutoPilot::start(self.world.agent.position, target, false, now).with_stop_distance(stop_distance);
+                self.autopilot = Some(pilot);
+                self.mcp_bridge.mcp_walk = Some(McpWalk {
                     target,
-                    false,
-                    Instant::now(),
-                ));
+                    stop_distance,
+                    deadline: (timeout_ms > 0).then(|| now + Duration::from_millis(timeout_ms)),
+                    outcome: None,
+                });
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "status": "moving",
                     "target": position,
+                    "stop_distance": stop_distance,
+                    "timeout_ms": timeout_ms,
                     "flying": self.world.agent.flying,
+                    "note": "poll avatar_movement_status for walk_outcome, or subscribe to the 'nav' event source",
                 }))));
             }
             ViewerRequest::NavMovementStatus => {
@@ -1288,8 +1806,10 @@ impl App {
                     }
                     None => (false, None, None),
                 };
+                let walk = self.mcp_bridge.mcp_walk.as_ref();
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "moving": moving,
+                    "walk_outcome": walk.map(|w| w.outcome.unwrap_or("walking")),
                     "target": target,
                     "current_position": [pos.x, pos.y, pos.z],
                     "distance_remaining": dist,
@@ -1300,6 +1820,7 @@ impl App {
             }
             ViewerRequest::NavStop => {
                 self.autopilot = None;
+                self.mcp_finish_walk("stopped");
                 let pos = self.world.agent.position;
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "status": "stopped",
@@ -1317,26 +1838,35 @@ impl App {
                     let obj = self.world.objects.get(obj_idx).unwrap();
                     let target_uuid = obj.full_id;
                     let handle = obj.key.region;
-                    self.send(NetCommand::RequestSit {
+                    if let Err(e) = self.mcp_send(NetCommand::RequestSit {
                         handle,
                         target: target_uuid,
                         offset: Vec3::ZERO,
-                    });
+                    }) {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
                     let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                         "status": "sit_requested",
                         "target_uuid": target_uuid.to_string(),
                     }))));
                 } else {
+                    if let Err(e) = self.mcp_send(NetCommand::OneShotControl(aurora_net::control::SIT_ON_GROUND)) {
+                        let _ = reply_tx.send(Err(e));
+                        return;
+                    }
                     self.world.agent.ground_sit = true;
-                    self.send(NetCommand::OneShotControl(aurora_net::control::SIT_ON_GROUND));
                     let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                         "status": "ground_sitting",
                     }))));
                 }
             }
             ViewerRequest::NavStand => {
+                if let Err(e) = self.mcp_send(NetCommand::OneShotControl(aurora_net::control::STAND_UP)) {
+                    let _ = reply_tx.send(Err(e));
+                    return;
+                }
                 self.world.agent.ground_sit = false;
-                self.send(NetCommand::OneShotControl(aurora_net::control::STAND_UP));
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "status": "standing",
                 }))));
@@ -1345,24 +1875,29 @@ impl App {
                 let dest = Vec3::from_array(position);
                 let current_name = self.world.region_name();
                 let target_region = region_name.unwrap_or_else(|| current_name.clone());
-                if (target_region.is_empty() || target_region.eq_ignore_ascii_case(&current_name))
+                let sent = if (target_region.is_empty() || target_region.eq_ignore_ascii_case(&current_name))
                     && let Some(handle) = self.world.main_region
                 {
-                    self.send(NetCommand::TeleportTo {
+                    self.mcp_send(NetCommand::TeleportTo {
                         handle,
                         position: dest,
                         look_at: self.world.agent.forward(),
-                    });
+                    })
                 } else {
-                    self.send(NetCommand::TeleportToRegion {
+                    self.mcp_send(NetCommand::TeleportToRegion {
                         request: Uuid::new_v4(),
                         name: target_region.clone(),
                         position: dest,
                         look_at: self.world.agent.forward(),
-                    });
+                    })
+                };
+                if let Err(e) = sent {
+                    let _ = reply_tx.send(Err(e));
+                    return;
                 }
                 let _ = reply_tx.send(Ok(ViewerResponse::Json(json!({
                     "status": "teleport_initiated",
+                    "note": "subscribe to the 'teleport' event source for AgentMovementComplete / TeleportFailed",
                     "region_name": target_region,
                     "position": position,
                 }))));
@@ -1440,20 +1975,32 @@ impl App {
                     let _ = reply_tx.send(Err(McpError::InvalidParams(format!("Unknown viewer setting '{key}'"))));
                     return;
                 };
-                let leaf = canonical_key.rsplit('.').next().unwrap_or(&canonical_key).to_ascii_lowercase();
-                if matches!(leaf.as_str(), "rlva_enabled" | "login_uri" | "username" | "password" | "mfa_token")
-                    || matches!(
-                        canonical_key.to_ascii_lowercase().as_str(),
-                        "rlva.enabled" | "account.login_uri" | "account.username"
-                    )
-                {
+                let extra = self.mcp_bridge.effective_policy().settings_allow_csv();
+                if mcp_setting_protected(&canonical_key, &extra) {
                     let _ = reply_tx.send(Err(McpError::PermissionDenied(format!(
-                        "Setting '{canonical_key}' is security-sensitive and cannot be mutated via MCP"
+                        "Setting '{canonical_key}' is security-sensitive (login, updates, network, payments, RLVa, filters, \
+                         external programs) and cannot be changed via MCP unless listed in AURORA_MCP_SETTINGS_ALLOW"
+                    ))));
+                    return;
+                }
+                // the same RLVa locks as Preferences and the Debug Settings window
+                let locks = crate::settings::registry::Locks {
+                    camera_preset: self.world.rlva.camera_preset_locked(Uuid::nil()),
+                    camera_fov: false,
+                    sendim: self.world.rlva.has("sendim"),
+                    restricted: !self.world.rlva.restrictions().is_empty(),
+                };
+                if locks.locked(&canonical_key) {
+                    let _ = reply_tx.send(Err(McpError::PermissionDenied(format!(
+                        "Setting '{canonical_key}' is locked by an RLVa restriction"
                     ))));
                     return;
                 }
                 match crate::settings::registry::set(&mut self.settings, &canonical_key, value.clone()) {
                     Ok(()) => {
+                        // applied and saved by the frame's settings pass, as a
+                        // change made in Preferences or Debug Settings
+                        self.folders.settings_changed = true;
                         let _ = reply_tx.send(Ok(ViewerResponse::SettingMutated {
                             key: canonical_key,
                             previous_value: prev_val,
@@ -2311,6 +2858,260 @@ impl App {
                 let resp = self.handle_mcp_voice_transmit(transmitting);
                 let _ = reply_tx.send(resp);
             }
+            ViewerRequest::Raycast {
+                mode,
+                origin,
+                target,
+                direction,
+                max_distance,
+                include_avatars,
+                include_terrain,
+                include_phantom,
+            } => {
+                let resp = self.handle_mcp_raycast(
+                    &mode,
+                    origin,
+                    target,
+                    direction,
+                    max_distance,
+                    include_avatars,
+                    include_terrain,
+                    include_phantom,
+                );
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::ObjectInspect {
+                local_id,
+                object_uuid,
+                fetch,
+                timeout_ms,
+            } => {
+                self.start_mcp_object_inspect(local_id, object_uuid, fetch, timeout_ms, reply_tx);
+            }
+            ViewerRequest::RegionInfo { x, y } => {
+                let resp = self.handle_mcp_region_info(x, y);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::MapLookup {
+                name,
+                grid_x,
+                grid_y,
+                timeout_ms,
+            } => {
+                self.start_mcp_map_lookup(name, grid_x, grid_y, timeout_ms, reply_tx);
+            }
+            ViewerRequest::SearchPeople {
+                query,
+                resolve_uuids,
+                timeout_ms,
+            } => {
+                self.start_mcp_search_people(query, resolve_uuids, timeout_ms, reply_tx);
+            }
+            ViewerRequest::SearchPlaces {
+                query,
+                category,
+                pg,
+                mature,
+                adult,
+                timeout_ms,
+            } => {
+                self.start_mcp_search_places(query, category, pg, mature, adult, timeout_ms, reply_tx);
+            }
+            ViewerRequest::AvatarProfile {
+                agent_id,
+                refresh,
+                timeout_ms,
+            } => {
+                self.start_mcp_avatar_profile(agent_id, refresh, timeout_ms, reply_tx);
+            }
+            ViewerRequest::MediaInfo {
+                local_id,
+                object_uuid,
+                timeout_ms,
+            } => {
+                self.start_mcp_media_info(local_id, object_uuid, timeout_ms, reply_tx);
+            }
+            ViewerRequest::ImSessionsList => {
+                let _ = reply_tx.send(Ok(self.handle_mcp_im_sessions_list()));
+            }
+            ViewerRequest::ImSessionRead { session_id, limit } => {
+                let resp = self.handle_mcp_im_session_read(session_id, limit);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::ImSessionSend {
+                session_id,
+                group_id,
+                target_uuid,
+                participants,
+                message,
+                action,
+            } => {
+                let resp = self.handle_mcp_im_session_send(session_id, group_id, target_uuid, participants, message, &action);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::ImTyping {
+                target_uuid,
+                session_id,
+                typing,
+            } => {
+                let resp = self.handle_mcp_im_typing(target_uuid, session_id, typing);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::SocialOffersList => {
+                let _ = reply_tx.send(Ok(self.handle_mcp_social_offers_list()));
+            }
+            ViewerRequest::SocialOfferRespond { notification_id, accept } => {
+                let resp = self.handle_mcp_social_offer_respond(notification_id, accept);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::TeleportOffer {
+                target_uuids,
+                message,
+                mode,
+            } => {
+                let resp = self.handle_mcp_teleport_offer(target_uuids, message, &mode);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::LandmarkCreate {
+                name,
+                folder_id,
+                folder_path,
+                timeout_ms,
+            } => {
+                self.start_mcp_landmark_create(name, folder_id, folder_path, timeout_ms, reply_tx);
+            }
+            ViewerRequest::TeleportLandmark { item_id } => {
+                let resp = self.handle_mcp_teleport_landmark(item_id);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::SetHome => {
+                let resp = self.handle_mcp_set_home();
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::TeleportHome => {
+                let resp = self.handle_mcp_teleport_home();
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::PrimDuplicate {
+                local_ids,
+                offset,
+                select_copy,
+                timeout_ms,
+            } => {
+                self.start_mcp_prim_duplicate(local_ids, offset, select_copy, timeout_ms, reply_tx);
+            }
+            ViewerRequest::PrimSelect { action, local_ids, extend } => {
+                let resp = self.handle_mcp_prim_select(&action, local_ids, extend);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::LinksetTransform {
+                root_local_id,
+                local_ids,
+                translate,
+                rotate_deg,
+                pivot,
+                scale_factor,
+            } => {
+                let resp = self.handle_mcp_linkset_transform(root_local_id, local_ids, translate, rotate_deg, pivot, scale_factor);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::BuildTransaction { ops, dry_run } => {
+                let resp = self.handle_mcp_build_transaction(ops, dry_run);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::ScriptReset {
+                local_id,
+                object_uuid,
+                item_id,
+                script_name,
+            } => {
+                let resp = self.handle_mcp_script_reset(local_id, object_uuid, item_id, script_name.as_deref());
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::ScriptSetRunning {
+                local_id,
+                object_uuid,
+                item_id,
+                script_name,
+                running,
+            } => {
+                let resp = self.handle_mcp_script_set_running(local_id, object_uuid, item_id, script_name.as_deref(), running);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::PrimSetGltfMaterial {
+                local_id,
+                face,
+                asset_id,
+                clear_override,
+                spec,
+            } => {
+                let resp = self.handle_mcp_prim_set_gltf_material(local_id, face, asset_id, clear_override, &spec);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::PrimSetMedia {
+                local_id,
+                face,
+                clear,
+                spec,
+            } => {
+                let resp = self.handle_mcp_prim_set_media(local_id, face, clear, &spec);
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::PrimSetSculpt {
+                local_id,
+                sculpt_texture,
+                sculpt_type,
+                invert,
+                mirror,
+                clear_sculpt,
+                flexible,
+                light,
+            } => {
+                let resp = self.handle_mcp_prim_set_sculpt(
+                    local_id,
+                    sculpt_texture,
+                    sculpt_type.as_deref(),
+                    invert,
+                    mirror,
+                    clear_sculpt,
+                    flexible,
+                    light,
+                );
+                let _ = reply_tx.send(resp);
+            }
+            ViewerRequest::InventoryCreateFolder {
+                name,
+                parent_id,
+                parent_path,
+                timeout_ms,
+            } => {
+                self.start_mcp_inventory_create_folder(name, parent_id, parent_path, timeout_ms, reply_tx);
+            }
+            ViewerRequest::InventoryMove {
+                ids,
+                target_folder_id,
+                target_folder_path,
+                timeout_ms,
+            } => {
+                self.start_mcp_inventory_move(ids, target_folder_id, target_folder_path, timeout_ms, reply_tx);
+            }
+            ViewerRequest::InventoryRename {
+                id,
+                name,
+                description,
+                timeout_ms,
+            } => {
+                self.start_mcp_inventory_rename(id, name, description, timeout_ms, reply_tx);
+            }
+            ViewerRequest::InventoryCopy {
+                ids,
+                target_folder_id,
+                target_folder_path,
+                as_links,
+            } => {
+                let resp = self.handle_mcp_inventory_copy(ids, target_folder_id, target_folder_path, as_links);
+                let _ = reply_tx.send(resp);
+            }
         }
     }
 
@@ -3152,7 +3953,7 @@ impl App {
             }
         }
         if !updates.is_empty() {
-            self.send(NetCommand::Build(BuildCmd::Transform { handle, updates }));
+            self.mcp_send(NetCommand::Build(BuildCmd::Transform { handle, updates }))?;
         }
         Ok(ViewerResponse::Json(json!({
             "transformed_count": transforms.len(),
@@ -3238,15 +4039,15 @@ impl App {
             self.check_object_modify_permission(idx)?;
         }
         if delink {
-            self.send(NetCommand::Build(BuildCmd::Delink {
+            self.mcp_send(NetCommand::Build(BuildCmd::Delink {
                 handle,
                 local_ids: local_ids.clone(),
-            }));
+            }))?;
         } else {
-            self.send(NetCommand::Build(BuildCmd::Link {
+            self.mcp_send(NetCommand::Build(BuildCmd::Link {
                 handle,
                 local_ids: local_ids.clone(),
-            }));
+            }))?;
         }
         Ok(ViewerResponse::Json(json!({
             "action": if delink { "delinked" } else { "linked" },
@@ -3267,13 +4068,13 @@ impl App {
             14, // FT_TRASH
         )
         .unwrap_or_default();
-        self.send(NetCommand::Build(BuildCmd::DeRez {
+        self.mcp_send(NetCommand::Build(BuildCmd::DeRez {
             handle,
             local_ids: local_ids.clone(),
             destination: aurora_net::build::derez::TRASH,
             destination_id: trash_id,
             group_id: self.world.groups.active,
-        }));
+        }))?;
         Ok(ViewerResponse::Json(json!({
             "deleted_local_ids": local_ids,
         })))
@@ -3774,6 +4575,9 @@ impl App {
                     "message": n.body,
                     "questions": questions,
                     "permissions": crate::world::notifications::permission_lines(*questions),
+                    "takes_money": questions & PERMISSION_DEBIT != 0,
+                    "debit_allowed": (questions & PERMISSION_DEBIT != 0)
+                        .then(|| self.mcp_debit_allowed(*task, caution.as_ref().map(|c| c.owner_name.as_str()))),
                     "experience": experience.as_ref().map(|e| json!({ "id": e.id.to_string(), "name": e.name })),
                     "caution": caution.is_some(),
                 })),
@@ -3781,6 +4585,26 @@ impl App {
             })
             .collect();
         ViewerResponse::Json(json!({ "count": prompts.len(), "prompts": prompts }))
+    }
+
+    /// The owner of the object behind a permission request is allowed to take
+    /// L$ through MCP (AURORA_MCP_DEBIT_ALLOW).
+    fn mcp_debit_allowed(&self, task: Uuid, owner_name: Option<&str>) -> bool {
+        let owner_id = self
+            .world
+            .objects
+            .index_of_uuid(&task)
+            .and_then(|i| self.world.objects.get(i))
+            .map(|o| o.owner_id)
+            .filter(|id| !id.is_nil());
+        let policy = self.mcp_bridge.effective_policy();
+        debit_allowed(
+            &policy.debit_allow,
+            self.world.agent_id,
+            &self.world.notifications.own_name,
+            owner_id,
+            owner_name,
+        )
     }
 
     /// Answer one prompt the way its card's buttons do (`respond_notification`).
@@ -3793,6 +4617,31 @@ impl App {
         ignore: bool,
     ) -> Result<ViewerResponse, McpError> {
         use crate::world::notifications::{Data, Response};
+        // Granting PERMISSION_DEBIT lets a script take any amount of L$, past
+        // every MCP payment cap: only for objects the debit policy allows.
+        if grant == Some(true)
+            && !ignore
+            && let Some((task, questions, owner_name)) =
+                self.world
+                    .notifications
+                    .list
+                    .iter()
+                    .find(|n| n.id == id)
+                    .and_then(|n| match &n.data {
+                        Data::Permissions {
+                            task, questions, caution, ..
+                        } => Some((*task, *questions, caution.as_ref().map(|c| c.owner_name.clone()))),
+                        _ => None,
+                    })
+            && questions & PERMISSION_DEBIT != 0
+            && !self.mcp_debit_allowed(task, owner_name.as_deref())
+        {
+            return Err(McpError::PermissionDenied(format!(
+                "prompt {id} asks to take L$ from your account (PERMISSION_DEBIT) and its object{} is not on the MCP debit allowlist; \
+                 answer it with grant:false, or add its owner to AURORA_MCP_DEBIT_ALLOW (UUIDs or names, 'self' by default)",
+                owner_name.map(|o| format!(" (owned by {o})")).unwrap_or_default()
+            )));
+        }
         let Some(n) = self.world.notifications.list.iter_mut().find(|n| n.id == id) else {
             return Err(McpError::InvalidParams(format!(
                 "no open script prompt {id} (answered, ignored or expired?): list them with script_prompts"
@@ -3897,22 +4746,45 @@ impl App {
     /// The agents' control bar: who has the viewer, Allow / Not now / Take back,
     /// and how it is shared (ui/agent_control.rs).
     pub(crate) fn draw_agent_control(&mut self, ctx: &egui::Context, p: &crate::theme::Palette) {
-        let Some(leases) = self.mcp_bridge.server_handle.as_ref().map(|h| h.leases.clone()) else {
+        let Some((leases, events, approvals)) = self
+            .mcp_bridge
+            .server_handle
+            .as_ref()
+            .map(|h| (h.leases.clone(), h.events.clone(), h.approvals.clone()))
+        else {
             return;
         };
         let view = leases.view();
-        if view.active.is_some() || view.asking.is_some() {
+        let pending_approval = approvals.next_pending();
+        if view.active.is_some() || view.asking.is_some() || pending_approval.is_some() {
             // the countdowns move: draw again within a second
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
-        match crate::ui::agent_control::show(ctx, p, &view) {
+        match crate::ui::agent_control::show(ctx, p, &view, pending_approval.as_ref()) {
             Some(crate::ui::agent_control::AgentControlAction::Allow(owner)) => leases.human_allow(&owner),
             Some(crate::ui::agent_control::AgentControlAction::NotNow(owner)) => leases.human_not_now(&owner),
+            Some(crate::ui::agent_control::AgentControlAction::ApproveAction(id)) => {
+                approvals.approve(&id);
+                events.publish("audit", "ActionApproved", json!({ "id": id }));
+            }
+            Some(crate::ui::agent_control::AgentControlAction::DenyAction(id)) => {
+                approvals.deny(&id);
+                events.publish("audit", "ActionDenied", json!({ "id": id }));
+            }
             Some(crate::ui::agent_control::AgentControlAction::TakeBack) => {
+                let previous_owner = view.active.as_ref().map(|a| a.owner.clone());
                 let rollbacks = leases.human_take_back();
                 self.mcp_apply_rollbacks(rollbacks);
+                events.publish(
+                    "lease",
+                    "LeaseTakenBack",
+                    json!({ "previous_owner": previous_owner, "mode": "hold" }),
+                );
             }
-            Some(crate::ui::agent_control::AgentControlAction::Mode(mode)) => leases.set_mode(mode),
+            Some(crate::ui::agent_control::AgentControlAction::Mode(mode)) => {
+                leases.set_mode(mode);
+                events.publish("lease", "HumanModeChanged", json!({ "mode": mode }));
+            }
             None => {}
         }
     }
@@ -4391,6 +5263,23 @@ impl App {
                         .unwrap_or_default()
                 }
                 .with_fallback(self.world.upload_cost);
+                // upload fees have their own MCP budget (AURORA_MCP_UPLOAD_BUDGET),
+                // apart from the payment caps
+                let Some(cost) = self.imports.total(&prices) else {
+                    return Err(McpError::InvalidParams(
+                        "the upload's fee is not known (an entry has an error or no quote): fix it, run quote, then upload".into(),
+                    ));
+                };
+                let budget = self.mcp_bridge.effective_policy().upload_budget.max(0);
+                let next = self.mcp_bridge.session_upload_spent.saturating_add(cost.max(0));
+                if next > budget {
+                    return Err(McpError::PermissionDenied(format!(
+                        "this upload costs L${cost}, past the MCP upload budget of L${budget} for this session \
+                         (L${} already spent; raise AURORA_MCP_UPLOAD_BUDGET to allow more)",
+                        self.mcp_bridge.session_upload_spent
+                    )));
+                }
+                self.mcp_bridge.session_upload_spent = next;
                 self.imports
                     .start_confirmed(&self.world, &self.settings.inventory, &self.settings.imports, &prices);
             }
@@ -4590,13 +5479,13 @@ impl App {
             .filter(|it| it.parent == destination_id)
             .map(|it| it.id)
             .collect();
-        self.send(NetCommand::Build(BuildCmd::DeRez {
+        self.mcp_send(NetCommand::Build(BuildCmd::DeRez {
             handle,
             local_ids: vec![local_id],
             destination,
             destination_id,
             group_id,
-        }));
+        }))?;
         if is_take {
             let (spare, _) = oneshot::channel();
             return Ok(Some(PendingTake {
@@ -5044,7 +5933,9 @@ impl App {
             let _ = self.set_floater_open(f, true);
         }
         let p = path.trim().to_ascii_lowercase();
-        if p.ends_with("/blender_live/remove_meshes") || p == "remove_meshes" {
+        if p.is_empty() && floater.is_some() {
+            // only opening the floater was asked
+        } else if p.ends_with("/blender_live/remove_meshes") || p == "remove_meshes" {
             let _ = self.handle_mcp_livemesh_control("remove_meshes", None)?;
         } else if p.ends_with("/blender_live/import") {
             let _ = self.handle_mcp_livemesh_control("import_to_uploader", None)?;
@@ -5062,6 +5953,11 @@ impl App {
             && !floater_name.contains('/')
         {
             let _ = self.set_floater_open(floater_name, true)?;
+        } else {
+            return Err(McpError::NotImplemented(format!(
+                "ui_click cannot press '{path}': only floaters (/main_view/floaters/<name>) and the Blender Live / mesh import \
+                 buttons are wired. Use the dedicated tool instead (e.g. prim_*, asset_upload, nav_move_and_teleport)"
+            )));
         }
 
         let observed = observe_path.and_then(|op| self.handle_mcp_ui_inspect(op).ok()).map(|r| match r {
@@ -5084,6 +5980,10 @@ impl App {
         let p = path.trim().to_ascii_lowercase();
         if p.contains("chat") {
             self.chat_ui.input = text.to_owned();
+        } else {
+            return Err(McpError::NotImplemented(format!(
+                "ui_set_text can only fill the chat input bar, not '{path}'; to speak use comms_send"
+            )));
         }
         Ok(ViewerResponse::Json(json!({
             "ok": true,
@@ -5096,7 +5996,11 @@ impl App {
         if (path.contains("local_mesh") || path.contains("import"))
             && let Some(choice_str) = value.as_str()
         {
-            let _ = self.handle_mcp_asset_upload("status", Vec::new(), Some(choice_str), None, None, None, None, Vec::new());
+            self.handle_mcp_asset_upload("status", Vec::new(), Some(choice_str), None, None, None, None, Vec::new())?;
+        } else {
+            return Err(McpError::NotImplemented(format!(
+                "ui_select only picks the importer's kind (path containing 'import', value e.g. \"mesh\"), not '{path}'"
+            )));
         }
         Ok(ViewerResponse::Json(json!({
             "ok": true,
@@ -5112,32 +6016,21 @@ impl App {
         modifiers: &[String],
         observe_path: Option<&str>,
     ) -> Result<ViewerResponse, McpError> {
-        let observed = observe_path.and_then(|op| self.handle_mcp_ui_inspect(op).ok()).map(|r| match r {
-            ViewerResponse::Json(v) => v,
-            _ => Value::Null,
-        });
-        Ok(ViewerResponse::Json(json!({
-            "ok": true,
-            "path": path,
-            "keysym": keysym,
-            "modifiers": modifiers,
-            "observed": observed,
-        })))
+        let _ = (modifiers, observe_path);
+        Err(McpError::NotImplemented(format!(
+            "ui_press_key does not inject key presses yet (asked: '{keysym}' on '{path}'); use the dedicated tool for the action"
+        )))
     }
 
     fn handle_mcp_ui_list_menus(&self, query: &str) -> Result<ViewerResponse, McpError> {
         let q = query.trim().to_ascii_lowercase();
         let all_menus = [
             "world.login",
-            "world.new_prim",
             "world.sit_down",
             "world.stand_up",
-            "world.set_home",
             "world.teleport_home",
             "build.open",
             "build.edit_particles",
-            "build.link",
-            "build.unlink",
             "file.import_mesh",
             "file.import_texture",
             "file.import_sound",
@@ -5199,15 +6092,24 @@ impl App {
             "avatar.reset_skeleton" => {
                 self.scene.reset_skeleton(self.world.agent_id, false);
             }
+            "world.sit_down" => {
+                self.mcp_send(NetCommand::OneShotControl(aurora_net::control::SIT_ON_GROUND))?;
+                self.world.agent.ground_sit = true;
+            }
             "world.stand_up" => {
-                self.world.agent.seated = false;
+                self.mcp_send(NetCommand::OneShotControl(aurora_net::control::STAND_UP))?;
                 self.world.agent.ground_sit = false;
             }
             "world.teleport_home" => {
-                self.send(NetCommand::TeleportHome);
+                self.mcp_send(NetCommand::TeleportHome)?;
             }
             "world.login" | "viewer.login" | "login" => {
-                let _ = self.handle_mcp_viewer_login(None, None, None, None);
+                return self.handle_mcp_viewer_login(None, None, None, None);
+            }
+            "world.new_prim" | "build.link" | "build.unlink" | "world.set_home" => {
+                return Err(McpError::NotImplemented(format!(
+                    "menu '{key}' is not wired; use prim_rez_new / prim_link (delink: true) instead"
+                )));
             }
             other => {
                 return Err(McpError::InvalidParams(format!(
@@ -5245,13 +6147,13 @@ impl App {
             normal: Vec3::Z,
             binormal: Vec3::Y,
         };
-        self.send(NetCommand::ObjectGrab {
+        self.mcp_send(NetCommand::ObjectGrab {
             handle,
             local_id,
             offset: Vec3::ZERO,
             surface,
-        });
-        self.send(NetCommand::ObjectRelease { handle, local_id, surface });
+        })?;
+        self.mcp_send(NetCommand::ObjectRelease { handle, local_id, surface })?;
         Ok(ViewerResponse::Json(json!({
             "ok": true,
             "local_id": local_id,
@@ -6055,6 +6957,61 @@ impl App {
 
     // ---- Phase 8: Land, Parcel & Estate Suite ----
 
+    fn mcp_parcel_rights(&self, owner_id: Uuid, group_id: Uuid, flags: u32) -> (bool, bool, bool, bool, bool, bool) {
+        let region_info = self
+            .world
+            .main_region
+            .and_then(|h| self.world.regions.get(&h))
+            .and_then(|r| r.info.as_ref());
+        let is_estate_manager =
+            region_info.is_some_and(|i| i.is_estate_manager || i.owner == self.world.agent_id) || self.world.god_level > 0;
+        let is_region_owner = region_info.is_some_and(|i| i.owner == self.world.agent_id);
+        let is_parcel_owner = owner_id == self.world.agent_id;
+        let is_parcel_group_member = (group_id != Uuid::nil()) && (self.world.groups.active == group_id);
+
+        let can_build = is_estate_manager
+            || is_parcel_owner
+            || (flags & aurora_net::parcel_flags::CREATE_OBJECTS != 0)
+            || (is_parcel_group_member && (flags & aurora_net::parcel_flags::CREATE_GROUP_OBJECTS != 0));
+
+        let can_run_scripts = is_estate_manager
+            || is_parcel_owner
+            || (flags & aurora_net::parcel_flags::ALLOW_OTHER_SCRIPTS != 0)
+            || (is_parcel_group_member && (flags & aurora_net::parcel_flags::ALLOW_GROUP_SCRIPTS != 0));
+
+        (
+            is_estate_manager,
+            is_region_owner,
+            is_parcel_owner,
+            is_parcel_group_member,
+            can_build,
+            can_run_scripts,
+        )
+    }
+
+    fn mcp_capabilities_parcel_summary(&self) -> Value {
+        let Some(p) = self
+            .world
+            .parcel
+            .as_ref()
+            .or_else(|| self.world.land.sel.as_ref().and_then(|s| s.parcel.as_ref()))
+        else {
+            return Value::Null;
+        };
+        let (is_estate_manager, _, is_parcel_owner, _, can_build, can_run_scripts) =
+            self.mcp_parcel_rights(p.owner_id, p.group_id, p.flags);
+        json!({
+            "local_id": p.local_id,
+            "name": p.name,
+            "can_build": can_build,
+            "can_run_scripts": can_run_scripts,
+            "can_manage_parcel": is_estate_manager || is_parcel_owner,
+            "can_manage_estate": is_estate_manager,
+            "parcel_prim_capacity": p.max_prims,
+            "parcel_prims_used": p.total_prims,
+        })
+    }
+
     fn handle_mcp_parcel_info(&self) -> Result<ViewerResponse, McpError> {
         let parcel_opt = self
             .world
@@ -6065,26 +7022,8 @@ impl App {
             return Err(McpError::NotInWorld);
         };
 
-        let region_info = self
-            .world
-            .main_region
-            .and_then(|h| self.world.regions.get(&h))
-            .and_then(|r| r.info.as_ref());
-        let is_estate_manager =
-            region_info.is_some_and(|i| i.is_estate_manager || i.owner == self.world.agent_id) || self.world.god_level > 0;
-        let is_region_owner = region_info.is_some_and(|i| i.owner == self.world.agent_id);
-        let is_parcel_owner = p.owner_id == self.world.agent_id;
-        let is_parcel_group_member = (p.group_id != Uuid::nil()) && (self.world.groups.active == p.group_id);
-
-        let can_build = is_estate_manager
-            || is_parcel_owner
-            || (p.flags & aurora_net::parcel_flags::CREATE_OBJECTS != 0)
-            || (is_parcel_group_member && (p.flags & aurora_net::parcel_flags::CREATE_GROUP_OBJECTS != 0));
-
-        let can_run_scripts = is_estate_manager
-            || is_parcel_owner
-            || (p.flags & aurora_net::parcel_flags::ALLOW_OTHER_SCRIPTS != 0)
-            || (is_parcel_group_member && (p.flags & aurora_net::parcel_flags::ALLOW_GROUP_SCRIPTS != 0));
+        let (is_estate_manager, is_region_owner, is_parcel_owner, is_parcel_group_member, can_build, can_run_scripts) =
+            self.mcp_parcel_rights(p.owner_id, p.group_id, p.flags);
 
         let ground_height_at_avatar = self.world.ground_height(self.world.agent.position);
 
@@ -6143,10 +7082,10 @@ impl App {
         let mut update = ParcelUpdate::from_parcel(p);
         update.music_url = music_url.to_string();
 
-        self.send(NetCommand::Land(LandCommand::Update {
+        self.mcp_send(NetCommand::Land(LandCommand::Update {
             handle,
             update: Box::new(update),
-        }));
+        }))?;
 
         if let Some(parcel) = self.world.parcel.as_mut() {
             Arc::make_mut(parcel).music_url = music_url.to_string();
@@ -6189,10 +7128,10 @@ impl App {
             update.flags = new_flags;
         }
 
-        self.send(NetCommand::Land(LandCommand::Update {
+        self.mcp_send(NetCommand::Land(LandCommand::Update {
             handle,
             update: Box::new(update),
-        }));
+        }))?;
 
         if let Some(parcel) = self.world.parcel.as_mut() {
             let m = Arc::make_mut(parcel);
@@ -6243,12 +7182,12 @@ impl App {
             Vec::new()
         };
 
-        self.send(NetCommand::Land(LandCommand::AccessListUpdate {
+        self.mcp_send(NetCommand::Land(LandCommand::AccessListUpdate {
             handle,
             local_id,
             flags,
             entries,
-        }));
+        }))?;
 
         Ok(ViewerResponse::Json(json!({
             "ok": true,
@@ -6265,11 +7204,11 @@ impl App {
         let target = Uuid::parse_str(target_uuid_str.trim()).map_err(|e| McpError::InvalidParams(format!("invalid resident UUID: {e}")))?;
 
         let ban_flag = ban.unwrap_or(false);
-        self.send(NetCommand::Land(LandCommand::EjectUser {
+        self.mcp_send(NetCommand::Land(LandCommand::EjectUser {
             handle,
             target,
             ban: ban_flag,
-        }));
+        }))?;
 
         Ok(ViewerResponse::Json(json!({
             "ok": true,
@@ -6283,10 +7222,8 @@ impl App {
         if amount <= 0 {
             return Err(McpError::InvalidParams("amount must be greater than 0".into()));
         }
-        let max_per_tx = std::env::var("AURORA_MCP_MAX_PAY_LINDENS")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .unwrap_or(100);
+        let policy = self.mcp_bridge.effective_policy();
+        let max_per_tx = policy.max_pay_lindens;
         if max_per_tx <= 0 {
             return Err(McpError::PermissionDenied(
                 "MCP L$ payments are disabled (AURORA_MCP_MAX_PAY_LINDENS <= 0)".into(),
@@ -6297,10 +7234,7 @@ impl App {
                 "payment of L${amount} exceeds per-transaction MCP cap of L${max_per_tx} (AURORA_MCP_MAX_PAY_LINDENS)"
             )));
         }
-        let session_cap = std::env::var("AURORA_MCP_SESSION_PAY_LIMIT")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .unwrap_or(500);
+        let session_cap = policy.session_pay_limit;
         let next_total = self.mcp_bridge.session_lindens_spent.saturating_add(amount);
         if next_total > session_cap {
             return Err(McpError::PermissionDenied(format!(
@@ -6324,16 +7258,20 @@ impl App {
         amount: i32,
         message: Option<String>,
     ) -> Result<ViewerResponse, McpError> {
-        let balance = self.check_and_record_economy_spend(amount)?;
         let target = Uuid::parse_str(target_uuid_str.trim()).map_err(|e| McpError::InvalidParams(format!("invalid avatar UUID: {e}")))?;
+        let balance = self.check_and_record_economy_spend(amount)?;
 
         let msg = message.unwrap_or_default();
-        self.send(NetCommand::PayResident {
+        if let Err(e) = self.mcp_send(NetCommand::PayResident {
             to: target,
             group: false,
             amount,
             message: msg.clone(),
-        });
+        }) {
+            // not paid (@pay): not counted against the session cap
+            self.mcp_bridge.session_lindens_spent -= amount;
+            return Err(e);
+        }
 
         Ok(ViewerResponse::Json(json!({
             "ok": true,
@@ -6352,19 +7290,23 @@ impl App {
         amount: i32,
         description: Option<String>,
     ) -> Result<ViewerResponse, McpError> {
-        let balance = self.check_and_record_economy_spend(amount)?;
         let Some(handle) = self.world.main_region else {
             return Err(McpError::NotInWorld);
         };
         let (_idx, target_uuid) = self.resolve_prim_by_local_id(target_local_id)?;
+        let balance = self.check_and_record_economy_spend(amount)?;
 
         let desc = description.unwrap_or_else(|| format!("Object {target_local_id}"));
-        self.send(NetCommand::PayObject {
+        if let Err(e) = self.mcp_send(NetCommand::PayObject {
             handle,
             object: target_uuid,
             amount,
             description: desc.clone(),
-        });
+        }) {
+            // not paid (@buy): not counted against the session cap
+            self.mcp_bridge.session_lindens_spent -= amount;
+            return Err(e);
+        }
 
         Ok(ViewerResponse::Json(json!({
             "ok": true,
@@ -6415,7 +7357,7 @@ impl App {
             return Err(McpError::InvalidParams(format!("avatar is not a member of group '{group_id}'")));
         }
 
-        self.send(NetCommand::ActivateGroup(group_id));
+        self.mcp_send(NetCommand::ActivateGroup(group_id))?;
         self.world.groups.active = group_id;
 
         Ok(ViewerResponse::Json(json!({
@@ -6881,8 +7823,161 @@ fn validate_import_entry_ids(imports: &crate::imports::Imports, entry_ids: &[Str
     Ok(wanted)
 }
 
+/// Settings an agent may not change through `setting_set`: the login and
+/// account, updates and crash reports, the network (proxy, grids), payment
+/// confirmations, RLVa, the spam / block filters, auto-accepting inventory,
+/// trusted sites, and programs the viewer launches. Prefix match on the
+/// setting's key; `extra` (AURORA_MCP_SETTINGS_ALLOW, comma-separated keys or
+/// prefixes) opens some of them deliberately.
+const MCP_PROTECTED_SETTINGS: &[&str] = &[
+    "update_",
+    "ignored_update",
+    "crash_reports",
+    "username",
+    "remember_username",
+    "last_login",
+    "remember_password",
+    "grid",
+    "grids",
+    "custom_login_uri",
+    "start_location",
+    "start_region",
+    "mfa_hash",
+    "proxy",
+    "bandwidth_kbps",
+    "trusted_sites",
+    "warn_external_links",
+    "browser_",
+    "auto_accept_inventory",
+    "confirm_payments",
+    "payment_confirm_threshold",
+    "confirm_no_transfer_settings",
+    "revoke_permissions",
+    "rlva_enabled",
+    "rlva",
+    "bridge",
+    "use_bridge",
+    "anti_spam",
+    "object_im_filter",
+    "omnifilter",
+    "blocked_chat",
+    "script_editor",
+    "dev_toolbox",
+    "cache_location",
+    "chat_log_location",
+    "keybinds",
+];
+
+fn mcp_setting_protected(key: &str, extra: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let matches = |prefix: &str| {
+        let prefix = prefix.trim().to_ascii_lowercase();
+        !prefix.is_empty()
+            && (key == prefix || key.starts_with(&format!("{prefix}.")) || (prefix.ends_with('_') && key.starts_with(&prefix)))
+    };
+    MCP_PROTECTED_SETTINGS.iter().any(|p| matches(p))
+        && !extra
+            .split(',')
+            .any(|p| matches(p) || (!p.trim().is_empty() && key.starts_with(&p.trim().to_ascii_lowercase())))
+}
+
+/// LSL PERMISSION_DEBIT.
+const PERMISSION_DEBIT: i32 = 1 << 1;
+
+/// A resident's name as compared for the debit allowlist: "First Last",
+/// "first.last" and "First Resident" alike.
+fn debit_name_key(name: &str) -> String {
+    let n = name.trim().to_ascii_lowercase().replace('.', " ");
+    n.strip_suffix(" resident").unwrap_or(&n).trim().to_owned()
+}
+
+/// AURORA_MCP_DEBIT_ALLOW: comma-separated `self`, owner UUIDs or resident
+/// names, `*` for anyone, `none` for no one. `self` (the default) allows the
+/// agent's own objects and attachments.
+fn debit_allowed(spec: &str, agent_id: Uuid, own_name: &str, owner_id: Option<Uuid>, owner_name: Option<&str>) -> bool {
+    let owner_key = owner_name.map(debit_name_key).filter(|k| !k.is_empty());
+    spec.split(',').map(str::trim).filter(|e| !e.is_empty()).any(|entry| {
+        let lower = entry.to_ascii_lowercase();
+        match lower.as_str() {
+            "none" => false,
+            "*" | "all" | "any" => true,
+            "self" => {
+                owner_id == Some(agent_id)
+                    || (!own_name.trim().is_empty() && owner_key.as_deref() == Some(debit_name_key(own_name).as_str()))
+            }
+            _ => match Uuid::parse_str(entry) {
+                Ok(id) => owner_id == Some(id),
+                Err(_) => owner_key.as_deref() == Some(debit_name_key(entry).as_str()),
+            },
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mcp_bridge_push_event_delivers_to_event_bus() {
+        let bus = std::sync::Arc::new(aurora_mcp::EventBus::new());
+        bus.subscribe_session("agent-1", "region");
+        let mut bridge = super::McpBridge {
+            events: Some(std::sync::Arc::clone(&bus)),
+            ..Default::default()
+        };
+        bridge.push_event("region", "RegionRestart", serde_json::json!({ "seconds": 120 }));
+        let (evs, _, last_seq, _) = bus.read_for_session("agent-1", None, None, 10);
+        assert_eq!(last_seq, 1);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].source, "region");
+        assert_eq!(evs[0].event_type, "RegionRestart");
+        assert_eq!(evs[0].data["seconds"], serde_json::json!(120));
+    }
+
+    #[test]
+    fn protected_settings_stay_out_of_agents_reach() {
+        for key in [
+            "proxy.enabled",
+            "custom_login_uri",
+            "rlva_enabled",
+            "rlva.no_set_env",
+            "update_channel",
+            "auto_accept_inventory",
+            "script_editor.command",
+            "grids",
+        ] {
+            assert!(super::mcp_setting_protected(key, ""), "{key} must be protected");
+        }
+        for key in ["draw_distance", "camera.fov", "shadows", "audio.master", "show_chat", "grid_snap"] {
+            assert!(!super::mcp_setting_protected(key, ""), "{key} stays open to agents");
+        }
+        assert!(!super::mcp_setting_protected("auto_accept_inventory", "auto_accept_inventory"));
+        assert!(!super::mcp_setting_protected("rlva.no_set_env", "rlva."));
+        assert!(super::mcp_setting_protected("rlva_enabled", "rlva."));
+    }
+
+    #[test]
+    fn debit_allowlist_defaults_to_own_objects_only() {
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        // default "self": own objects by owner id or by name
+        assert!(super::debit_allowed("self", me, "Ada Lovelace", Some(me), None));
+        assert!(super::debit_allowed("self", me, "Ada Lovelace", None, Some("ada.lovelace")));
+        assert!(super::debit_allowed("self", me, "Ada Resident", None, Some("Ada")));
+        assert!(!super::debit_allowed(
+            "self",
+            me,
+            "Ada Lovelace",
+            Some(other),
+            Some("Mallory Vendor")
+        ));
+        assert!(!super::debit_allowed("self", me, "Ada Lovelace", None, None));
+        // explicit allowlist entries
+        let spec = format!("self, {other}, Trusted Creator");
+        assert!(super::debit_allowed(&spec, me, "Ada Lovelace", Some(other), None));
+        assert!(super::debit_allowed(&spec, me, "Ada Lovelace", None, Some("trusted.creator")));
+        assert!(!super::debit_allowed(&spec, me, "Ada Lovelace", None, Some("Someone Else")));
+        assert!(!super::debit_allowed("none", me, "Ada Lovelace", Some(me), None));
+        assert!(super::debit_allowed("*", me, "Ada Lovelace", None, None));
+    }
     use super::*;
 
     #[test]
@@ -7009,5 +8104,96 @@ mod tests {
             }
             other => panic!("expected no staged entry error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_bridge_effective_policy_uses_configured_policy() {
+        let mut policy = aurora_mcp::McpPolicy::default();
+        policy.upload_budget = 250;
+        policy.max_pay_lindens = 25;
+        policy.session_pay_limit = 75;
+        policy.debit_allow = "alice,bob".to_owned();
+        policy.settings_allow = vec!["rlva.".to_owned(), "auto_accept_inventory".to_owned()];
+
+        let bridge = super::McpBridge {
+            policy: Some(std::sync::Arc::new(policy)),
+            ..Default::default()
+        };
+        let eff = bridge.effective_policy();
+        assert_eq!(eff.upload_budget, 250);
+        assert_eq!(eff.max_pay_lindens, 25);
+        assert_eq!(eff.session_pay_limit, 75);
+        assert_eq!(eff.debit_allow, "alice,bob");
+        assert_eq!(eff.settings_allow_csv(), "rlva.,auto_accept_inventory");
+    }
+
+    #[test]
+    fn phase5_ray_box_hit_and_serialize_object_inspect_work_on_demo_world() {
+        // Ray-box intersection: front face hit & normal check, plus miss.
+        let hit = super::perception::ray_box_hit(
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::new(0.0, 0.0, -1.0),
+            Vec3::ZERO,
+            Quat::IDENTITY,
+            Vec3::splat(1.0),
+        )
+        .expect("expected OBB hit");
+        assert!((hit.0 - 4.0).abs() < 1e-4, "unexpected distance {}", hit.0);
+        assert!((hit.1 - Vec3::Z).length() < 1e-4, "unexpected normal {:?}", hit.1);
+        assert!(super::perception::ray_box_hit(Vec3::new(5.0, 5.0, 5.0), Vec3::Z, Vec3::ZERO, Quat::IDENTITY, Vec3::splat(1.0)).is_none());
+
+        let mut world = crate::world::World::new(Arc::new(crate::scene::avatar::AvatarLibrary::load()));
+        for ev in crate::demo::events() {
+            world.apply(ev);
+        }
+        let idx = world
+            .objects
+            .iter()
+            .find(|(_, o)| !o.is_avatar())
+            .map(|(i, _)| i)
+            .expect("demo object present");
+        let build = crate::build::BuildTool::default();
+        let media = crate::media::MediaManager::default();
+        let inspected = super::perception::serialize_object_inspect(&world, &build, &media, idx).expect("object inspect json");
+        assert!(inspected.get("local_id").and_then(Value::as_u64).is_some());
+        assert!(inspected.get("object_uuid").and_then(Value::as_str).is_some());
+        assert!(inspected.get("faces").and_then(Value::as_array).is_some_and(|f| !f.is_empty()));
+    }
+
+    #[test]
+    fn phase5_compute_group_transforms_rotates_around_pivot_and_clamps_scale() {
+        let targets = vec![
+            super::building::GroupTransformTarget {
+                local_id: 1,
+                is_root: true,
+                position: Vec3::new(10.0, 10.0, 25.0),
+                rotation: Quat::IDENTITY,
+                scale: Vec3::ONE,
+            },
+            super::building::GroupTransformTarget {
+                local_id: 2,
+                is_root: false,
+                position: Vec3::new(11.0, 10.0, 25.0),
+                rotation: Quat::IDENTITY,
+                scale: Vec3::ONE,
+            },
+        ];
+        let out = super::building::compute_group_transforms(
+            &targets,
+            Some([0.0, 0.0, 2.0]),
+            Some([0.0, 0.0, 90.0]),
+            None,
+            Some([100.0, 2.0, 0.5]),
+        );
+        assert_eq!(out.len(), 2);
+        let (_, root_pos, _, root_scale) = &out[0];
+        assert!((*root_pos - Vec3::new(10.0, 10.0, 27.0)).length() < 1e-3);
+        assert_eq!(*root_scale, Vec3::new(64.0, 2.0, 0.5));
+
+        // Child relative to root [1, 0, 0] scaled by [100, 2, 0.5] => [100, 0, 0], rotated +90 deg Z => [0, 100, 0], + [10, 10, 27]
+        let (child_upd, child_pos, _, child_scale) = &out[1];
+        assert_eq!(child_upd.local_id, 2);
+        assert!((*child_pos - Vec3::new(10.0, 110.0, 27.0)).length() < 1e-2);
+        assert_eq!(*child_scale, Vec3::new(64.0, 2.0, 0.5));
     }
 }

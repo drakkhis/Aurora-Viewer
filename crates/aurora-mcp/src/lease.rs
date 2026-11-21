@@ -15,6 +15,10 @@ use uuid::Uuid;
 pub const DEFAULT_LEASE_SECONDS: u64 = 300;
 /// Maximum lease TTL (3600 seconds / 1 hour).
 pub const MAX_LEASE_SECONDS: u64 = 3600;
+/// A lease nobody has used for this long may be resumed by a caller giving
+/// the same `owner` but no `lease_id` (an agent that restarted and lost it).
+/// A lease in use can only be renewed with its `lease_id`.
+pub const IDLE_RESUME_SECONDS: u64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaseSnapshot {
@@ -37,11 +41,35 @@ struct ActiveLease {
     expires_at: Instant,
     expires_at_unix_ms: u64,
     rollbacks: Vec<RollbackAction>,
+    /// Last time the holder presented this lease's id (any tool call).
+    last_used: Instant,
+}
+
+/// How a caller matches the active lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderMatch {
+    /// Not the holder.
+    No,
+    /// Presented the lease's id.
+    ById,
+    /// Same owner, no id, and the lease sat idle for IDLE_RESUME_SECONDS:
+    /// resumed under a fresh id, so the lost one stops working.
+    IdleResume,
 }
 
 impl ActiveLease {
     fn is_expired(&self, now: Instant) -> bool {
         now >= self.expires_at
+    }
+
+    fn holder_match(&self, owner: &str, lease_id: Option<&str>, now: Instant) -> HolderMatch {
+        if lease_id.is_some_and(|id| !id.is_empty() && id == self.lease_id) {
+            HolderMatch::ById
+        } else if self.owner == owner && now.duration_since(self.last_used) >= Duration::from_secs(IDLE_RESUME_SECONDS) {
+            HolderMatch::IdleResume
+        } else {
+            HolderMatch::No
+        }
     }
 
     fn snapshot(&self, now: Instant) -> LeaseSnapshot {
@@ -106,6 +134,7 @@ struct Shared {
     asking: Option<(String, Instant)>,
     approved: Option<(String, Instant)>,
     not_now: HashMap<String, Instant>,
+    ask_deny_on_timeout: bool,
 }
 
 /// Why an agent did not get the lease yet (control_acquire answers it with
@@ -172,6 +201,7 @@ impl LeaseManager {
                 asking: None,
                 approved: None,
                 not_now: HashMap::new(),
+                ask_deny_on_timeout: false,
             }),
             auto_acquire,
         }
@@ -213,13 +243,14 @@ impl LeaseManager {
         // the holder renewing, or an expired lease to clear
         {
             let guard = self.inner.lock();
-            if let Some(active) = guard.as_ref().filter(|l| !l.is_expired(now)) {
-                let same = existing_lease_id.is_some_and(|id| id == active.lease_id) || active.owner == owner;
-                if same {
-                    drop(guard);
-                    let (snap, rb) = self.acquire(owner, purpose, ttl_secs, existing_lease_id)?;
-                    return Ok(AcquireOutcome::Granted(snap, rb));
-                }
+            if guard
+                .as_ref()
+                .filter(|l| !l.is_expired(now))
+                .is_some_and(|active| active.holder_match(owner, existing_lease_id, now) != HolderMatch::No)
+            {
+                drop(guard);
+                let (snap, rb) = self.acquire(owner, purpose, ttl_secs, existing_lease_id)?;
+                return Ok(AcquireOutcome::Granted(snap, rb));
             }
         }
         let mut sh = self.shared.lock();
@@ -310,6 +341,22 @@ impl LeaseManager {
                 }
             };
             let unanswered = now.duration_since(since) >= ASK_TIMEOUT;
+            if !approved && unanswered && sh.ask_deny_on_timeout {
+                sh.asking = None;
+                sh.not_now.insert(owner.to_owned(), now);
+                if wait {
+                    if let Some(i) = sh.queue.iter().position(|w| w.owner == owner) {
+                        let w = sh.queue.remove(i);
+                        sh.queue.push(w);
+                    }
+                    return Ok(AcquireOutcome::Waiting(waiting("approval_timed_out", 30, &None)));
+                } else {
+                    sh.queue.retain(|w| w.owner != owner);
+                    return Err(McpError::PermissionDenied(
+                        "approval prompt timed out without response (ask_deny_on_timeout enabled)".into(),
+                    ));
+                }
+            }
             if !approved && !unanswered {
                 let left = ASK_TIMEOUT.saturating_sub(now.duration_since(since)).as_secs();
                 return Ok(AcquireOutcome::Waiting(waiting("awaiting_approval", left.clamp(3, 10), &None)));
@@ -392,6 +439,14 @@ impl LeaseManager {
         }
     }
 
+    pub fn set_ask_deny_on_timeout(&self, deny: bool) {
+        self.shared.lock().ask_deny_on_timeout = deny;
+    }
+
+    pub fn ask_deny_on_timeout(&self) -> bool {
+        self.shared.lock().ask_deny_on_timeout
+    }
+
     /// Acquire or renew a control lease at once (no queue, no asking).
     ///
     /// If the same `owner` (or matching `lease_id`) already holds the active
@@ -430,14 +485,21 @@ impl LeaseManager {
         }
 
         if let Some(active) = guard.as_mut() {
-            let same_holder = existing_lease_id.is_some_and(|id| id == active.lease_id) || active.owner == owner;
-            if !same_holder {
-                let remaining = active.expires_at.saturating_duration_since(now).as_secs();
-                return Err(McpError::LeaseConflict {
-                    holder: active.owner.clone(),
-                    remaining_secs: remaining,
-                });
+            match active.holder_match(&owner, existing_lease_id, now) {
+                HolderMatch::No => {
+                    let remaining = active.expires_at.saturating_duration_since(now).as_secs();
+                    return Err(McpError::LeaseConflict {
+                        holder: active.owner.clone(),
+                        remaining_secs: remaining,
+                    });
+                }
+                HolderMatch::IdleResume => {
+                    log::info!("aurora-mcp: idle lease of '{owner}' resumed without its id; issuing a new lease_id");
+                    active.lease_id = Uuid::new_v4().to_string();
+                }
+                HolderMatch::ById => {}
             }
+            active.last_used = now;
             active.ttl = ttl;
             if !purpose.is_empty() {
                 active.purpose = purpose.to_owned();
@@ -455,6 +517,7 @@ impl LeaseManager {
             expires_at: now + ttl,
             expires_at_unix_ms: expires_unix_ms,
             rollbacks: Vec::new(),
+            last_used: now,
         };
         let snap = lease.snapshot(now);
         *guard = Some(lease);
@@ -504,7 +567,11 @@ impl LeaseManager {
                     remaining_secs: active.expires_at.saturating_duration_since(now).as_secs(),
                 });
             }
-            return Ok(active.lease_id.clone());
+            let id = active.lease_id.clone();
+            if let Some(active) = guard.as_mut() {
+                active.last_used = now;
+            }
+            return Ok(id);
         }
         if self.auto_acquire {
             let ttl = Duration::from_secs(DEFAULT_LEASE_SECONDS);
@@ -522,10 +589,20 @@ impl LeaseManager {
                 expires_at: now + ttl,
                 expires_at_unix_ms: expires_unix_ms,
                 rollbacks: Vec::new(),
+                last_used: now,
             });
             return Ok(lease_id);
         }
         Err(McpError::NoActiveLease)
+    }
+
+    /// The holder presented its lease on a call that needs none (a read):
+    /// it is still at work, so its lease is not idle.
+    pub fn touch(&self, lease_id: &str) {
+        let mut guard = self.inner.lock();
+        if let Some(active) = guard.as_mut().filter(|l| !lease_id.is_empty() && l.lease_id == lease_id) {
+            active.last_used = Instant::now();
+        }
     }
 
     /// Record a rollback action on the active lease, deduplicating so only the
@@ -570,7 +647,13 @@ mod tests {
         assert!(matches!(mgr.verify_for_mutation(Some("")), Err(McpError::LeaseConflict { .. })));
         assert!(matches!(mgr.release(None), Err(McpError::LeaseConflict { .. })));
 
-        // Same owner can renew.
+        // The same owner name without the lease_id cannot take a lease in use.
+        assert!(matches!(
+            mgr.acquire("agent-alpha", "", 300, None),
+            Err(McpError::LeaseConflict { .. })
+        ));
+
+        // The holder renews with its lease_id.
         let (renewed, _) = mgr.acquire("agent-alpha", "", 300, Some(&snap.lease_id)).expect("renew lease");
         assert_eq!(renewed.lease_id, snap.lease_id);
         assert_eq!(renewed.ttl_seconds, 300);
@@ -689,5 +772,67 @@ mod tests {
         assert_eq!(waiting(mgr.acquire_turn("alpha", "", 300, None, true)).reason, "held_by_human");
         mgr.set_mode(HumanMode::Auto);
         granted(mgr.acquire_turn("alpha", "", 300, None, true));
+    }
+
+    #[test]
+    fn same_owner_name_cannot_hijack_a_lease_in_use() {
+        let mgr = manager(HumanMode::Auto);
+        let first = granted(mgr.acquire_turn("mcp-agent", "", 300, None, false));
+        // a second agent using the default owner name gets no lease
+        assert!(matches!(
+            mgr.acquire_turn("mcp-agent", "", 300, None, false),
+            Err(McpError::LeaseConflict { .. })
+        ));
+        let w = waiting(mgr.acquire_turn("mcp-agent", "", 300, None, true));
+        assert_eq!(w.reason, "busy");
+        // the holder renews with its id
+        let renewed = granted(mgr.acquire_turn("mcp-agent", "", 300, Some(&first.lease_id), false));
+        assert_eq!(renewed.lease_id, first.lease_id);
+    }
+
+    #[test]
+    fn an_idle_lease_resumes_by_owner_under_a_new_id() {
+        let mgr = manager(HumanMode::Auto);
+        let first = granted(mgr.acquire_turn("builder", "", 600, None, false));
+        mgr.record_rollback(RollbackAction::ResetPoser);
+        // pretend it sat idle
+        mgr.inner.lock().as_mut().expect("active").last_used = Instant::now() - Duration::from_secs(IDLE_RESUME_SECONDS + 1);
+        let resumed = granted(mgr.acquire_turn("builder", "", 600, None, false));
+        assert_ne!(resumed.lease_id, first.lease_id, "a resumed lease gets a new id");
+        assert_eq!(resumed.rollback_count, 1, "its rollbacks are kept");
+        assert!(mgr.verify_for_mutation(Some(&first.lease_id)).is_err(), "the lost id stops working");
+        assert!(mgr.verify_for_mutation(Some(&resumed.lease_id)).is_ok());
+        // touching keeps a lease from being idle
+        mgr.inner.lock().as_mut().expect("active").last_used = Instant::now() - Duration::from_secs(IDLE_RESUME_SECONDS + 1);
+        mgr.touch(&resumed.lease_id);
+        assert!(matches!(
+            mgr.acquire_turn("builder", "", 600, None, false),
+            Err(McpError::LeaseConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn ask_mode_denies_on_timeout_when_opt_in_enabled() {
+        let mgr = manager(HumanMode::Ask);
+        mgr.set_ask_deny_on_timeout(true);
+        assert!(mgr.ask_deny_on_timeout());
+
+        let w = waiting(mgr.acquire_turn("alpha", "test", 300, None, true));
+        assert_eq!(w.reason, "awaiting_approval");
+
+        // Simulate Ask prompt timing out without human response.
+        mgr.shared.lock().asking = Some(("alpha".to_owned(), Instant::now() - ASK_TIMEOUT - Duration::from_secs(1)));
+
+        let err = mgr.acquire_turn("alpha", "test", 300, None, false);
+        assert!(matches!(err, Err(McpError::PermissionDenied(_))));
+
+        // Waiting mode returns approval_timed_out after a fresh timeout.
+        mgr.shared.lock().not_now.clear();
+        let _ = waiting(mgr.acquire_turn("beta", "test", 300, None, true));
+        mgr.shared.lock().asking = Some(("beta".to_owned(), Instant::now() - ASK_TIMEOUT - Duration::from_secs(1)));
+        assert_eq!(
+            waiting(mgr.acquire_turn("beta", "test", 300, None, true)).reason,
+            "approval_timed_out"
+        );
     }
 }

@@ -9,7 +9,7 @@
 
 use super::widgets::{self, ActionKind, action_button};
 use crate::theme::Palette;
-use aurora_mcp::{ControlView, HumanMode};
+use aurora_mcp::{ControlView, HumanMode, PendingApprovalView};
 use egui::{RichText, Vec2};
 
 const WIDTH: f32 = 380.0;
@@ -18,6 +18,8 @@ const BUTTON: Vec2 = Vec2::new(104.0, 28.0);
 pub enum AgentControlAction {
     Allow(String),
     NotNow(String),
+    ApproveAction(String),
+    DenyAction(String),
     TakeBack,
     Mode(HumanMode),
 }
@@ -26,8 +28,17 @@ fn minutes(secs: u64) -> String {
     secs.div_ceil(60).max(1).to_string()
 }
 
-pub fn show(ctx: &egui::Context, p: &Palette, view: &ControlView) -> Option<AgentControlAction> {
-    let quiet = view.active.is_none() && view.asking.is_none() && view.queue.is_empty() && view.mode != HumanMode::Hold;
+pub fn show(
+    ctx: &egui::Context,
+    p: &Palette,
+    view: &ControlView,
+    pending_approval: Option<&PendingApprovalView>,
+) -> Option<AgentControlAction> {
+    let quiet = view.active.is_none()
+        && view.asking.is_none()
+        && view.queue.is_empty()
+        && view.mode != HumanMode::Hold
+        && pending_approval.is_none();
     if quiet {
         return None;
     }
@@ -39,6 +50,29 @@ pub fn show(ctx: &egui::Context, p: &Palette, view: &ControlView) -> Option<Agen
         .show(ctx, |ui| {
             widgets::overlay(ui, p, egui::Margin::same(12), |ui| {
                 ui.set_width(WIDTH);
+                if let Some(req) = pending_approval {
+                    ui.label(
+                        RichText::new(format!("MCP approval: {}", req.tool))
+                            .size(13.5)
+                            .strong()
+                            .color(p.ink),
+                    );
+                    if !req.summary.is_empty() {
+                        ui.label(RichText::new(req.summary.clone()).size(12.0).color(p.ink));
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if action_button(ui, p, "check", aurora_i18n::tr!("agent-control-allow"), ActionKind::Primary, BUTTON).clicked() {
+                            out = Some(AgentControlAction::ApproveAction(req.id.clone()));
+                        }
+                        if action_button(ui, p, "clock", aurora_i18n::tr!("agent-control-not-now"), ActionKind::Flat, BUTTON).clicked() {
+                            out = Some(AgentControlAction::DenyAction(req.id.clone()));
+                        }
+                    });
+                    if view.asking.is_some() || view.active.is_some() || view.mode == HumanMode::Hold {
+                        ui.separator();
+                    }
+                }
                 if let Some(ask) = &view.asking {
                     ui.label(
                         RichText::new(aurora_i18n::tr!("agent-control-asks", agent = ask.owner.clone()))

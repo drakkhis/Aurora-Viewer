@@ -31,6 +31,46 @@ pub fn capture_output_dir() -> PathBuf {
     dir
 }
 
+/// Read a `capture_orbit` manifest back from disk (`capture_manifest_read`).
+///
+/// Only `manifest-*.json` files inside [`capture_output_dir`] are read: a bare
+/// manifest id names `manifest-<id>.json` there, and any other path must
+/// resolve (symlinks followed) into that directory. Arbitrary files on disk
+/// are refused.
+pub fn read_capture_manifest(key: &str) -> Result<serde_json::Value, McpError> {
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(McpError::InvalidParams("manifest_path or manifest_id is required".into()));
+    }
+    let dir = capture_output_dir();
+    let candidate = if key.contains(['/', '\\']) {
+        PathBuf::from(key)
+    } else if key.starts_with("manifest-") && key.ends_with(".json") {
+        dir.join(key)
+    } else {
+        dir.join(format!("manifest-{key}.json"))
+    };
+    let refuse = || McpError::PermissionDenied(format!("'{key}' is not a capture manifest in {}", dir.display()));
+    let canon_dir = dir.canonicalize().map_err(|_| refuse())?;
+    let canon = candidate
+        .canonicalize()
+        .map_err(|e| McpError::InvalidParams(format!("cannot read manifest '{key}': {e}")))?;
+    let name_ok = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("manifest-") && n.ends_with(".json"));
+    if !canon.starts_with(&canon_dir) || !name_ok {
+        return Err(refuse());
+    }
+    let meta = std::fs::metadata(&canon).map_err(|e| McpError::InvalidParams(format!("cannot read manifest '{key}': {e}")))?;
+    if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
+        return Err(refuse());
+    }
+    let text = std::fs::read_to_string(&canon).map_err(|e| McpError::InvalidParams(format!("cannot read manifest '{key}': {e}")))?;
+    serde_json::from_str(&text).map_err(|e| McpError::InvalidParams(format!("invalid manifest JSON: {e}")))
+}
+
 /// Downscales (if needed) and encodes a raw RGBA8 frame into a PNG file and
 /// Base64 payload on a background worker thread.
 pub fn encode_captured_frame(raw: RawCapturedFrame, max_dimensions: (u32, u32), label: &str) -> Result<EncodedCapture, McpError> {
@@ -217,5 +257,26 @@ mod tests {
         let diff = compare_images(&enc_a.path, &enc_b.path).expect("compare modified");
         assert_eq!(diff["identical"], false);
         assert_eq!(diff["changed_pixels"], 1);
+    }
+
+    #[test]
+    fn manifest_read_is_confined_to_the_capture_dir() {
+        assert!(matches!(read_capture_manifest("/etc/passwd"), Err(McpError::PermissionDenied(_))));
+        let outside = std::env::temp_dir().join(format!("manifest-outside-{}.json", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&outside, "{}").expect("write outside");
+        assert!(matches!(
+            read_capture_manifest(&outside.display().to_string()),
+            Err(McpError::PermissionDenied(_))
+        ));
+        let _ = std::fs::remove_file(&outside);
+        let id = uuid::Uuid::new_v4().to_string();
+        let inside = capture_output_dir().join(format!("manifest-{id}.json"));
+        std::fs::write(&inside, r#"{"manifest_id":"x"}"#).expect("write inside");
+        assert_eq!(read_capture_manifest(&id).expect("by id")["manifest_id"], "x");
+        assert_eq!(
+            read_capture_manifest(&inside.display().to_string()).expect("by path")["manifest_id"],
+            "x"
+        );
+        let _ = std::fs::remove_file(&inside);
     }
 }

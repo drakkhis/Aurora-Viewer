@@ -2496,6 +2496,10 @@ impl App {
             }
         }
         let outcome = self.world.rlva_send_boundary(&mut cmd, actor);
+        // `mcp_send` reports the first (outer) command's fate to its tool
+        if self.mcp_bridge.recording_boundary && self.mcp_bridge.last_boundary.is_none() {
+            self.mcp_bridge.last_boundary = Some(outcome);
+        }
         // (the self-test reads the answer to the command it just sent)
         self.rlva_selftest.runner.boundary(outcome, &cmd);
         match outcome {

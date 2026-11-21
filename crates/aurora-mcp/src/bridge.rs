@@ -36,6 +36,16 @@ pub enum McpError {
     PermissionDenied(String),
     #[error("viewer is not currently logged into a region or demo world")]
     NotInWorld,
+    /// The tool (or this path / option of it) does nothing yet: reported
+    /// instead of a success that did not happen.
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+    #[error("rate limit exceeded for '{category}': retry after {retry_after_ms}ms ({detail})")]
+    RateLimited {
+        category: String,
+        retry_after_ms: u64,
+        detail: String,
+    },
     #[error("{0}")]
     Internal(String),
 }
@@ -181,6 +191,7 @@ pub enum ViewerRequest {
     // Phase 0: Core Status, Capabilities, Leases & Dynamic Calls
     ConnectionStatus,
     CapabilitiesRefresh,
+    CapabilitiesSummary,
     ApplyRollbacks {
         actions: Vec<RollbackAction>,
     },
@@ -698,6 +709,184 @@ pub enum ViewerRequest {
     VoiceTransmit {
         transmitting: bool,
     },
+
+    // Phase 12 (MCP Phase 5): C3 Perception
+    Raycast {
+        mode: String,
+        origin: Option<[f32; 3]>,
+        target: Option<[f32; 3]>,
+        direction: Option<[f32; 3]>,
+        max_distance: f32,
+        include_avatars: bool,
+        include_terrain: bool,
+        include_phantom: bool,
+    },
+    ObjectInspect {
+        local_id: Option<u32>,
+        object_uuid: Option<Uuid>,
+        fetch: bool,
+        timeout_ms: u64,
+    },
+    RegionInfo {
+        x: Option<f32>,
+        y: Option<f32>,
+    },
+    MapLookup {
+        name: Option<String>,
+        grid_x: Option<u16>,
+        grid_y: Option<u16>,
+        timeout_ms: u64,
+    },
+    SearchPeople {
+        query: Option<String>,
+        resolve_uuids: Vec<Uuid>,
+        timeout_ms: u64,
+    },
+    SearchPlaces {
+        query: String,
+        category: i8,
+        pg: bool,
+        mature: bool,
+        adult: bool,
+        timeout_ms: u64,
+    },
+    AvatarProfile {
+        agent_id: Uuid,
+        refresh: bool,
+        timeout_ms: u64,
+    },
+    MediaInfo {
+        local_id: Option<u32>,
+        object_uuid: Option<Uuid>,
+        timeout_ms: u64,
+    },
+
+    // Phase 12 (MCP Phase 5): C4 Social & Comms
+    ImSessionsList,
+    ImSessionRead {
+        session_id: Uuid,
+        limit: usize,
+    },
+    ImSessionSend {
+        session_id: Option<Uuid>,
+        group_id: Option<Uuid>,
+        target_uuid: Option<Uuid>,
+        participants: Vec<Uuid>,
+        message: Option<String>,
+        action: String,
+    },
+    ImTyping {
+        target_uuid: Option<Uuid>,
+        session_id: Option<Uuid>,
+        typing: bool,
+    },
+    SocialOffersList,
+    SocialOfferRespond {
+        notification_id: u64,
+        accept: bool,
+    },
+    TeleportOffer {
+        target_uuids: Vec<Uuid>,
+        message: String,
+        mode: String,
+    },
+    LandmarkCreate {
+        name: Option<String>,
+        folder_id: Option<Uuid>,
+        folder_path: Option<String>,
+        timeout_ms: u64,
+    },
+    TeleportLandmark {
+        item_id: Uuid,
+    },
+    SetHome,
+    TeleportHome,
+
+    // Phase 12 (MCP Phase 5): C5 Building, Scripting & Inventory Organization
+    PrimDuplicate {
+        local_ids: Vec<u32>,
+        offset: [f32; 3],
+        select_copy: bool,
+        timeout_ms: u64,
+    },
+    PrimSelect {
+        action: String,
+        local_ids: Vec<u32>,
+        extend: bool,
+    },
+    LinksetTransform {
+        root_local_id: Option<u32>,
+        local_ids: Vec<u32>,
+        translate: Option<[f32; 3]>,
+        rotate_deg: Option<[f32; 3]>,
+        pivot: Option<[f32; 3]>,
+        scale_factor: Option<[f32; 3]>,
+    },
+    BuildTransaction {
+        ops: Vec<Value>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    ScriptReset {
+        local_id: Option<u32>,
+        object_uuid: Option<Uuid>,
+        item_id: Option<Uuid>,
+        script_name: Option<String>,
+    },
+    ScriptSetRunning {
+        local_id: Option<u32>,
+        object_uuid: Option<Uuid>,
+        item_id: Option<Uuid>,
+        script_name: Option<String>,
+        running: bool,
+    },
+    PrimSetGltfMaterial {
+        local_id: u32,
+        face: Option<i32>,
+        asset_id: Option<Uuid>,
+        clear_override: bool,
+        spec: Value,
+    },
+    PrimSetMedia {
+        local_id: u32,
+        face: u8,
+        clear: bool,
+        spec: Value,
+    },
+    PrimSetSculpt {
+        local_id: u32,
+        sculpt_texture: Option<Uuid>,
+        sculpt_type: Option<String>,
+        invert: Option<bool>,
+        mirror: Option<bool>,
+        clear_sculpt: bool,
+        flexible: Option<Value>,
+        light: Option<Value>,
+    },
+    InventoryCreateFolder {
+        name: String,
+        parent_id: Option<Uuid>,
+        parent_path: Option<String>,
+        timeout_ms: u64,
+    },
+    InventoryMove {
+        ids: Vec<Uuid>,
+        target_folder_id: Option<Uuid>,
+        target_folder_path: Option<String>,
+        timeout_ms: u64,
+    },
+    InventoryRename {
+        id: Uuid,
+        name: String,
+        description: Option<String>,
+        timeout_ms: u64,
+    },
+    InventoryCopy {
+        ids: Vec<Uuid>,
+        target_folder_id: Option<Uuid>,
+        target_folder_path: Option<String>,
+        as_links: bool,
+    },
 }
 
 /// Raw frame returned from the viewer/render pipeline before off-thread PNG encoding.
@@ -745,6 +934,7 @@ impl ViewerRequest {
         match self {
             ViewerRequest::ConnectionStatus
             | ViewerRequest::CapabilitiesRefresh
+            | ViewerRequest::CapabilitiesSummary
             | ViewerRequest::ApplyRollbacks { .. }
             | ViewerRequest::EventsSubscribe { .. }
             | ViewerRequest::EventsUnsubscribe { .. }
@@ -784,7 +974,18 @@ impl ViewerRequest {
             | ViewerRequest::FriendsList { .. }
             | ViewerRequest::EnvironmentGet
             | ViewerRequest::VoiceStatus
-            | ViewerRequest::VoiceParticipantsList => false,
+            | ViewerRequest::VoiceParticipantsList
+            | ViewerRequest::Raycast { .. }
+            | ViewerRequest::ObjectInspect { .. }
+            | ViewerRequest::RegionInfo { .. }
+            | ViewerRequest::MapLookup { .. }
+            | ViewerRequest::SearchPeople { .. }
+            | ViewerRequest::SearchPlaces { .. }
+            | ViewerRequest::AvatarProfile { .. }
+            | ViewerRequest::MediaInfo { .. }
+            | ViewerRequest::ImSessionsList
+            | ViewerRequest::ImSessionRead { .. }
+            | ViewerRequest::SocialOffersList => false,
 
             ViewerRequest::LiveMeshControl { action, .. } | ViewerRequest::AssetUpload { action, .. } => {
                 !action.eq_ignore_ascii_case("status")
@@ -858,6 +1059,27 @@ impl ViewerRequest {
             | ViewerRequest::TaskItemRemove { .. }
             | ViewerRequest::TaskItemAdd { .. }
             | ViewerRequest::TaskNotecardWrite { .. }
+            | ViewerRequest::ImSessionSend { .. }
+            | ViewerRequest::ImTyping { .. }
+            | ViewerRequest::SocialOfferRespond { .. }
+            | ViewerRequest::TeleportOffer { .. }
+            | ViewerRequest::LandmarkCreate { .. }
+            | ViewerRequest::TeleportLandmark { .. }
+            | ViewerRequest::SetHome
+            | ViewerRequest::TeleportHome
+            | ViewerRequest::PrimDuplicate { .. }
+            | ViewerRequest::PrimSelect { .. }
+            | ViewerRequest::LinksetTransform { .. }
+            | ViewerRequest::BuildTransaction { .. }
+            | ViewerRequest::ScriptReset { .. }
+            | ViewerRequest::ScriptSetRunning { .. }
+            | ViewerRequest::PrimSetGltfMaterial { .. }
+            | ViewerRequest::PrimSetMedia { .. }
+            | ViewerRequest::PrimSetSculpt { .. }
+            | ViewerRequest::InventoryCreateFolder { .. }
+            | ViewerRequest::InventoryMove { .. }
+            | ViewerRequest::InventoryRename { .. }
+            | ViewerRequest::InventoryCopy { .. }
             | ViewerRequest::ViewerShutdown => true,
         }
     }

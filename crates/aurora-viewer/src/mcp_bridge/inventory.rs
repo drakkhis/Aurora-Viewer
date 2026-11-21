@@ -19,6 +19,31 @@ pub(super) struct PendingTrash {
     reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
 }
 
+pub(super) struct PendingFolderCreate {
+    folder_id: Uuid,
+    parent: Uuid,
+    name: String,
+    started: Instant,
+    deadline: Duration,
+    reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
+}
+
+pub(super) struct PendingInvMove {
+    ids: Vec<Uuid>,
+    target: Uuid,
+    started: Instant,
+    deadline: Duration,
+    reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
+}
+
+pub(super) struct PendingInvRename {
+    id: Uuid,
+    name: String,
+    started: Instant,
+    deadline: Duration,
+    reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
+}
+
 impl App {
     /// "/My Inventory/SLC Builder/Builds/Sausage Table" (the first segment may
     /// be the root's own name, or left out) to that folder: exact names, the
@@ -154,5 +179,249 @@ impl App {
                 self.mcp_bridge.pending_trash.push_back(p);
             }
         }
+    }
+
+    fn resolve_target_folder(&self, id: Option<Uuid>, path: Option<&str>) -> Result<Uuid, McpError> {
+        match (id, path) {
+            (Some(fid), _) => {
+                if !self.world.inventory.folders.contains_key(&fid) {
+                    return Err(McpError::InvalidParams(format!("no folder {fid} in inventory")));
+                }
+                Ok(fid)
+            }
+            (None, Some(p)) => self.resolve_inventory_path(p),
+            (None, None) => Ok(self.world.inventory.root),
+        }
+    }
+
+    pub(super) fn start_mcp_inventory_create_folder(
+        &mut self,
+        name: String,
+        parent_id: Option<Uuid>,
+        parent_path: Option<String>,
+        timeout_ms: u64,
+        reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
+    ) {
+        let parent = match self.resolve_target_folder(parent_id, parent_path.as_deref()) {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = reply_tx.send(Err(e));
+                return;
+            }
+        };
+        if !rules::destination(&self.world.inventory, parent) {
+            let _ = reply_tx.send(Err(McpError::PermissionDenied(
+                "target parent folder cannot receive new folders".into(),
+            )));
+            return;
+        }
+        let change = match rules::create_folder(parent, &name) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = reply_tx.send(Err(McpError::InvalidParams(e)));
+                return;
+            }
+        };
+        let (folder_id, clean_name) = match change.operations.first() {
+            Some(aurora_net::inventory::operations::Operation::Folder { id, name, .. }) => (*id, name.clone()),
+            _ => {
+                let _ = reply_tx.send(Err(McpError::Internal("unexpected folder mutation shape".into())));
+                return;
+            }
+        };
+        self.edit_inventory(change, false, Uuid::nil());
+        self.mcp_bridge.pending_folder_creates.push_back(PendingFolderCreate {
+            folder_id,
+            parent,
+            name: clean_name,
+            started: Instant::now(),
+            deadline: Duration::from_millis(timeout_ms.clamp(500, 20_000)),
+            reply_tx,
+        });
+    }
+
+    pub(super) fn poll_mcp_inventory_create_folder(&mut self) {
+        let now = Instant::now();
+        for p in std::mem::take(&mut self.mcp_bridge.pending_folder_creates) {
+            if self.world.inventory.folders.contains_key(&p.folder_id) {
+                let path = self.inventory_folder_path(p.folder_id);
+                let _ = p.reply_tx.send(Ok(ViewerResponse::Json(json!({
+                    "ok": true,
+                    "verified": true,
+                    "folder_id": p.folder_id.to_string(),
+                    "parent_id": p.parent.to_string(),
+                    "name": p.name,
+                    "path": path,
+                }))));
+            } else if now.duration_since(p.started) >= p.deadline {
+                let _ = p.reply_tx.send(Err(McpError::Timeout(p.deadline.as_millis() as u64)));
+            } else {
+                self.mcp_bridge.pending_folder_creates.push_back(p);
+            }
+        }
+    }
+
+    pub(super) fn start_mcp_inventory_move(
+        &mut self,
+        ids: Vec<Uuid>,
+        target_folder_id: Option<Uuid>,
+        target_folder_path: Option<String>,
+        timeout_ms: u64,
+        reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
+    ) {
+        let target = match (target_folder_id, target_folder_path.as_deref()) {
+            (Some(fid), _) => {
+                if !self.world.inventory.folders.contains_key(&fid) {
+                    let _ = reply_tx.send(Err(McpError::InvalidParams(format!("no folder {fid} in inventory"))));
+                    return;
+                }
+                fid
+            }
+            (None, Some(path)) => match self.resolve_inventory_path(path) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = reply_tx.send(Err(e));
+                    return;
+                }
+            },
+            (None, None) => {
+                let _ = reply_tx.send(Err(McpError::InvalidParams(
+                    "provide target_folder_id or target_folder_path".into(),
+                )));
+                return;
+            }
+        };
+        let worn = self.world.outfit_attachment_items();
+        let change = match rules::move_selection(&self.world.inventory, &ids, target, &HashSet::new(), &worn) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = reply_tx.send(Err(McpError::PermissionDenied(e)));
+                return;
+            }
+        };
+        self.edit_inventory(change, false, Uuid::nil());
+        self.mcp_bridge.pending_inv_moves.push_back(PendingInvMove {
+            ids,
+            target,
+            started: Instant::now(),
+            deadline: Duration::from_millis(timeout_ms.clamp(500, 20_000)),
+            reply_tx,
+        });
+    }
+
+    pub(super) fn poll_mcp_inventory_move(&mut self) {
+        let now = Instant::now();
+        for p in std::mem::take(&mut self.mcp_bridge.pending_inv_moves) {
+            let moved = p.ids.iter().all(|id| rules::parent(&self.world.inventory, *id) == Some(p.target));
+            if moved {
+                let _ = p.reply_tx.send(Ok(ViewerResponse::Json(json!({
+                    "ok": true,
+                    "verified": true,
+                    "moved_count": p.ids.len(),
+                    "target_folder_id": p.target.to_string(),
+                    "target_path": self.inventory_folder_path(p.target),
+                }))));
+            } else if now.duration_since(p.started) >= p.deadline {
+                let _ = p.reply_tx.send(Err(McpError::Timeout(p.deadline.as_millis() as u64)));
+            } else {
+                self.mcp_bridge.pending_inv_moves.push_back(p);
+            }
+        }
+    }
+
+    pub(super) fn start_mcp_inventory_rename(
+        &mut self,
+        id: Uuid,
+        name: String,
+        description: Option<String>,
+        timeout_ms: u64,
+        reply_tx: oneshot::Sender<Result<ViewerResponse, McpError>>,
+    ) {
+        let inv = &self.world.inventory;
+        if !rules::renameable(inv, id) {
+            let _ = reply_tx.send(Err(McpError::PermissionDenied(
+                "item/folder cannot be renamed (system, library, or missing modify permission)".into(),
+            )));
+            return;
+        }
+        let clean = match rules::clean_name(&name) {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = reply_tx.send(Err(McpError::InvalidParams(e)));
+                return;
+            }
+        };
+        let mut map = aurora_llsd::Map::new();
+        map.insert("name".into(), aurora_llsd::Llsd::String(clean.clone()));
+        if let Some(desc) = description
+            && inv.items.contains_key(&id)
+        {
+            map.insert("desc".into(), aurora_llsd::Llsd::String(desc));
+        }
+        let change = match rules::patch(inv, id, aurora_llsd::Llsd::Map(map)) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = reply_tx.send(Err(McpError::InvalidParams(e)));
+                return;
+            }
+        };
+        self.edit_inventory(change, false, Uuid::nil());
+        self.mcp_bridge.pending_inv_renames.push_back(PendingInvRename {
+            id,
+            name: clean,
+            started: Instant::now(),
+            deadline: Duration::from_millis(timeout_ms.clamp(500, 20_000)),
+            reply_tx,
+        });
+    }
+
+    pub(super) fn poll_mcp_inventory_rename(&mut self) {
+        let now = Instant::now();
+        for p in std::mem::take(&mut self.mcp_bridge.pending_inv_renames) {
+            if rules::name(&self.world.inventory, p.id) == p.name {
+                let _ = p.reply_tx.send(Ok(ViewerResponse::Json(json!({
+                    "ok": true,
+                    "verified": true,
+                    "id": p.id.to_string(),
+                    "name": p.name,
+                }))));
+            } else if now.duration_since(p.started) >= p.deadline {
+                let _ = p.reply_tx.send(Err(McpError::Timeout(p.deadline.as_millis() as u64)));
+            } else {
+                self.mcp_bridge.pending_inv_renames.push_back(p);
+            }
+        }
+    }
+
+    pub(super) fn handle_mcp_inventory_copy(
+        &mut self,
+        ids: Vec<Uuid>,
+        target_folder_id: Option<Uuid>,
+        target_folder_path: Option<String>,
+        as_links: bool,
+    ) -> Result<ViewerResponse, McpError> {
+        let target = match (target_folder_id, target_folder_path.as_deref()) {
+            (Some(fid), _) => {
+                if !self.world.inventory.folders.contains_key(&fid) {
+                    return Err(McpError::InvalidParams(format!("no folder {fid} in inventory")));
+                }
+                fid
+            }
+            (None, Some(path)) => self.resolve_inventory_path(path)?,
+            (None, None) => {
+                return Err(McpError::InvalidParams("provide target_folder_id or target_folder_path".into()));
+            }
+        };
+        let worn = self.world.outfit_attachment_items();
+        let change = rules::paste(&self.world.inventory, &ids, target, false, as_links, &HashSet::new(), &worn)
+            .map_err(McpError::PermissionDenied)?;
+        self.edit_inventory(change, false, Uuid::nil());
+        Ok(ViewerResponse::Json(json!({
+            "ok": true,
+            "copied_count": ids.len(),
+            "target_folder_id": target.to_string(),
+            "target_path": self.inventory_folder_path(target),
+            "as_links": as_links,
+        })))
     }
 }
